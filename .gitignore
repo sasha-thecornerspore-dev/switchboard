@@ -1,0 +1,26 @@
+# Dependencies / build output
+node_modules/
+dist/
+out/
+*.tsbuildinfo
+
+# Runtime state & SECRETS — never commit these
+switchboard-config.json
+switchboard-users.json
+FIRST-RUN-ADMIN-PASSWORD.txt
+logs/
+*.jsonl
+*.log
+
+# Anything that looks like a credential or key
+*apikey*
+*api_key*
+*.pem
+*.key
+*secret*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

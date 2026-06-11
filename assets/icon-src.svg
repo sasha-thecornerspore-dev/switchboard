@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1B3461"/>
+      <stop offset="1" stop-color="#0A1733"/>
+    </linearGradient>
+    <linearGradient id="cordA" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFD069"/>
+      <stop offset="1" stop-color="#E09B1A"/>
+    </linearGradient>
+    <radialGradient id="jack" cx="0.35" cy="0.3" r="1">
+      <stop offset="0" stop-color="#FFE9B8"/>
+      <stop offset="0.45" stop-color="#F4B33C"/>
+      <stop offset="1" stop-color="#9C6B10"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Panel -->
+  <rect x="16" y="16" width="480" height="480" rx="104" fill="url(#bg)"/>
+  <rect x="16" y="16" width="480" height="480" rx="104" fill="none" stroke="#F4B33C" stroke-opacity="0.55" stroke-width="14"/>
+
+  <!-- Jack sockets: 3x3 grid -->
+  <g>
+    <circle cx="136" cy="136" r="44" fill="url(#jack)"/>
+    <circle cx="136" cy="136" r="24" fill="#0A1733"/>
+    <circle cx="256" cy="136" r="44" fill="url(#jack)"/>
+    <circle cx="256" cy="136" r="24" fill="#0A1733"/>
+    <circle cx="376" cy="136" r="44" fill="url(#jack)"/>
+    <circle cx="376" cy="136" r="24" fill="#0A1733"/>
+
+    <circle cx="136" cy="256" r="44" fill="url(#jack)"/>
+    <circle cx="136" cy="256" r="24" fill="#0A1733"/>
+    <circle cx="256" cy="256" r="44" fill="url(#jack)"/>
+    <circle cx="256" cy="256" r="24" fill="#0A1733"/>
+    <circle cx="376" cy="256" r="44" fill="url(#jack)"/>
+    <circle cx="376" cy="256" r="24" fill="#0A1733"/>
+
+    <circle cx="136" cy="376" r="44" fill="url(#jack)"/>
+    <circle cx="136" cy="376" r="24" fill="#0A1733"/>
+    <circle cx="256" cy="376" r="44" fill="url(#jack)"/>
+    <circle cx="256" cy="376" r="24" fill="#0A1733"/>
+    <circle cx="376" cy="376" r="44" fill="url(#jack)"/>
+    <circle cx="376" cy="376" r="24" fill="#0A1733"/>
+  </g>
+
+  <!-- Patch cord 1: top-left jack to middle-right jack -->
+  <path d="M 136 136 C 136 260, 280 180, 376 256" fill="none" stroke="#0A1733" stroke-width="46" stroke-linecap="round"/>
+  <path d="M 136 136 C 136 260, 280 180, 376 256" fill="none" stroke="url(#cordA)" stroke-width="30" stroke-linecap="round"/>
+
+  <!-- Patch cord 2: bottom-middle jack to middle-left jack -->
+  <path d="M 256 376 C 200 376, 150 330, 136 256" fill="none" stroke="#0A1733" stroke-width="46" stroke-linecap="round"/>
+  <path d="M 256 376 C 200 376, 150 330, 136 256" fill="none" stroke="url(#cordA)" stroke-width="30" stroke-linecap="round"/>
+
+  <!-- Plugs (cord endpoints) -->
+  <circle cx="136" cy="136" r="30" fill="url(#cordA)"/>
+  <circle cx="136" cy="136" r="13" fill="#5a3c0a"/>
+  <circle cx="376" cy="256" r="30" fill="url(#cordA)"/>
+  <circle cx="376" cy="256" r="13" fill="#5a3c0a"/>
+  <circle cx="256" cy="376" r="30" fill="url(#cordA)"/>
+  <circle cx="256" cy="376" r="13" fill="#5a3c0a"/>
+  <circle cx="136" cy="256" r="30" fill="url(#cordA)"/>
+  <circle cx="136" cy="256" r="13" fill="#5a3c0a"/>
+</svg>
