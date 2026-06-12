@@ -19,6 +19,12 @@ logs/
 *.key
 *secret*
 
+# Code-signing certs — private keys, NEVER commit
+certs/
+*.pfx
+*.p12
+*.pfx.b64
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

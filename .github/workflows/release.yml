@@ -37,6 +37,13 @@ jobs:
         run: npx electron-builder --${{ matrix.platform }} --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # --- Code signing (optional) ---
+          # To sign, add CSC_LINK + CSC_KEY_PASSWORD repository secrets (see
+          # docs/SIGNING.md) and uncomment the two lines below. Leaving them
+          # commented keeps unsigned builds working; an EMPTY CSC_LINK would
+          # fail the build, so only enable once the secrets actually exist.
+          # CSC_LINK: ${{ secrets.CSC_LINK }}
+          # CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
