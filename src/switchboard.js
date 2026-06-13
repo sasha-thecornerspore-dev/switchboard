@@ -204,7 +204,24 @@ function ts(args) {
   });
 }
 
+// Is the Tailscale CLI/app actually present on this machine? Distinct from
+// "installed but stopped/signed-out" so the UI can offer to INSTALL vs CONNECT.
+function detectTailscaleInstalled() {
+  if (process.platform === "win32") {
+    return fs.existsSync(`${process.env.PROGRAMFILES}\\Tailscale\\tailscale.exe`)
+        || fs.existsSync(`${process.env["ProgramFiles(x86)"] || ""}\\Tailscale\\tailscale.exe`);
+  }
+  if (fs.existsSync("/Applications/Tailscale.app/Contents/MacOS/Tailscale")) return true;
+  try { require("child_process").execSync("command -v tailscale", { stdio: "ignore" }); return true; }
+  catch { return false; }
+}
+
 async function refreshTailscale() {
+  state.tailscaleInstalled = detectTailscaleInstalled();
+  if (!state.tailscaleInstalled) {
+    state.backendState = "NotInstalled";
+    return;
+  }
   try {
     const j = JSON.parse(await ts("status --json"));
     state.backendState = j.BackendState || "Unknown";
@@ -216,6 +233,38 @@ async function refreshTailscale() {
     if (state.backendState !== "Unreachable") console.error("Tailscale status failed:", String(e).slice(0, 200));
     state.backendState = "Unreachable";
   }
+}
+
+// Install Tailscale via the OS package manager. Windows → winget (official
+// Tailscale.Tailscale package); macOS → Homebrew cask. Returns the command
+// output, or a typed error with a manual-download URL when no package manager
+// is available. May surface a UAC/elevation prompt to the user.
+const TAILSCALE_DOWNLOAD = "https://tailscale.com/download";
+function hasCmd(cmd) {
+  try { require("child_process").execSync(process.platform === "win32" ? `where ${cmd}` : `command -v ${cmd}`, { stdio: "ignore" }); return true; }
+  catch { return false; }
+}
+function installTailscale() {
+  return new Promise((resolve, reject) => {
+    let cmd, manual = TAILSCALE_DOWNLOAD;
+    if (process.platform === "win32") {
+      if (!hasCmd("winget")) return reject(Object.assign(new Error("winget isn't available on this PC. Install Tailscale manually."), { manualUrl: manual + "/windows" }));
+      cmd = `winget install --id Tailscale.Tailscale -e --silent --accept-package-agreements --accept-source-agreements`;
+    } else if (process.platform === "darwin") {
+      if (!hasCmd("brew")) return reject(Object.assign(new Error("Homebrew isn't installed. Install Tailscale manually."), { manualUrl: manual + "/mac" }));
+      cmd = `brew install --cask tailscale`;
+    } else {
+      return reject(Object.assign(new Error("Auto-install is only supported on Windows and macOS."), { manualUrl: manual }));
+    }
+    exec(cmd, { windowsHide: true, timeout: 5 * 60 * 1000, maxBuffer: 8 * 1024 * 1024 }, async (err, stdout, stderr) => {
+      if (err) {
+        const msg = (stderr || stdout || err.message || "").toString().slice(0, 400);
+        return reject(Object.assign(new Error("Install failed: " + msg), { manualUrl: manual }));
+      }
+      await refreshTailscale();
+      resolve((stdout || "").toString().slice(-400));
+    });
+  });
 }
 
 // Bring the Tailscale backend up. Plain `up` first; if stored prefs are
@@ -482,7 +531,8 @@ async function handleApi(req, res, parsed, me) {
     }));
     return send(res, 200, {
       tailnetHost: state.tailnetHost, tailnetIPv4: state.tailnetIPv4,
-      backendState: state.backendState, me: publicUser(me), isAdmin: isAdmin(me),
+      backendState: state.backendState, tailscaleInstalled: state.tailscaleInstalled !== false,
+      me: publicUser(me), isAdmin: isAdmin(me),
       shares: sharesOut
     });
   }
@@ -541,6 +591,17 @@ async function handleApi(req, res, parsed, me) {
       reconcileShares(); // fire-and-forget — UI polls /api/state for progress
       return send(res, 200, { ok: true, backendState: state.backendState });
     } catch (e) { return send(res, 500, { error: e.message }); }
+  }
+
+  if (route === "tailscale/install" && req.method === "POST") {
+    if (!isAdmin(me)) return send(res, 403, { error: "admin only" });
+    if (state.tailscaleInstalled) return send(res, 200, { ok: true, alreadyInstalled: true, backendState: state.backendState });
+    try {
+      const out = await installTailscale();
+      return send(res, 200, { ok: true, backendState: state.backendState, tailscaleInstalled: state.tailscaleInstalled, output: out });
+    } catch (e) {
+      return send(res, 500, { error: e.message, manualUrl: e.manualUrl });
+    }
   }
 
   if (route === "shares" && req.method === "POST") {
@@ -1159,12 +1220,29 @@ setInterval(function() {
 
 async function connectTailscale() {
   const btn = document.getElementById('banner-btn');
+  const label = btn.textContent;
   btn.textContent = 'Connecting…'; btn.disabled = true;
   const r = await api('POST', '/api/tailscale/up');
-  btn.textContent = 'Connect Tailscale'; btn.disabled = false;
+  btn.textContent = label; btn.disabled = false;
   if (r.error) { toast('Tailscale: ' + r.error); return; }
   toast('Tailscale connected');
   bamfloozle(60);
+  refresh();
+}
+
+async function installTailscale() {
+  const btn = document.getElementById('banner-btn');
+  btn.textContent = 'Installing…'; btn.disabled = true;
+  toast('Installing Tailscale — this can take a minute and may ask for admin permission.');
+  const r = await api('POST', '/api/tailscale/install');
+  btn.disabled = false; btn.textContent = '⬇ Install Tailscale';
+  if (r.error) {
+    toast('Install failed: ' + r.error);
+    if (r.manualUrl) window.open(r.manualUrl, '_blank');
+    return;
+  }
+  toast('Tailscale installed — now sign in to bring your shares online.');
+  bamfloozle(80);
   refresh();
 }
 function setMode(m) { MODE = m;
@@ -1564,17 +1642,29 @@ async function refresh() {
   // Tailscale health banner
   const bs = data.backendState || 'Unknown';
   const banner = document.getElementById('banner');
+  const bbtn = document.getElementById('banner-btn');
+  const notInstalled = (bs === 'NotInstalled') || (data.tailscaleInstalled === false);
   if (bs !== 'Running') {
     const msgs = {
+      NotInstalled: 'Tailscale isn\\'t installed — Switchboard needs it to publish your shares.',
       Stopped: 'Tailscale is <b>stopped</b> — share URLs are unreachable until it connects.',
       Starting: 'Tailscale is <b>starting</b> — shares will come back automatically once it connects.',
       NoState: 'Tailscale is <b>starting</b> — if this persists, restart the Tailscale service or reboot.',
-      NeedsLogin: 'Tailscale <b>needs login</b> — open the Tailscale app in your system tray and sign in.',
+      NeedsLogin: 'Tailscale is installed but <b>not signed in</b> — connect your account to bring shares online.',
       Unreachable: 'The Tailscale service is <b>not responding</b> — try restarting it from an admin terminal: <code>Restart-Service Tailscale</code>.',
     };
-    document.getElementById('banner-msg').innerHTML = msgs[bs] || ('Tailscale state: <b>' + bs + '</b>');
-    banner.classList.toggle('warn', bs === 'Starting' || bs === 'NoState');
-    document.getElementById('banner-btn').style.display = (bs === 'Stopped' || bs === 'Unreachable' || bs === 'NoState') ? '' : 'none';
+    document.getElementById('banner-msg').innerHTML = notInstalled ? msgs.NotInstalled : (msgs[bs] || ('Tailscale state: <b>' + bs + '</b>'));
+    banner.classList.toggle('warn', bs === 'Starting' || bs === 'NoState' || bs === 'NeedsLogin');
+    // Action button (admin only): INSTALL when missing, CONNECT/SIGN-IN when down.
+    if (!data.isAdmin) {
+      bbtn.style.display = 'none';
+    } else if (notInstalled) {
+      bbtn.style.display = ''; bbtn.textContent = '⬇ Install Tailscale'; bbtn.onclick = installTailscale;
+    } else if (bs === 'Stopped' || bs === 'Unreachable' || bs === 'NoState' || bs === 'NeedsLogin') {
+      bbtn.style.display = ''; bbtn.textContent = (bs === 'NeedsLogin' ? 'Sign in to Tailscale' : 'Connect Tailscale'); bbtn.onclick = connectTailscale;
+    } else {
+      bbtn.style.display = 'none';
+    }
     banner.classList.add('show');
   } else {
     banner.classList.remove('show');

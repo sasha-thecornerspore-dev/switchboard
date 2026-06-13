@@ -22,6 +22,7 @@ exactly the shares you choose.
   - Cookie sessions; first-run admin is auto-provisioned
 - **Password-protected shares** (HTTP Basic auth) with auto-generated credentials and a one-click "ready-to-send" block
 - **Live dashboard** — hits, bytes, unique visitors, per-minute sparkline, activity feed, QR codes
+- **Tailscale-aware** — detects whether Tailscale is installed, running, and signed in; offers a one-click **install** (winget on Windows, Homebrew on macOS) or **connect** right from the dashboard when it's missing or down
 - **Self-healing** — watches the Tailscale backend and auto-restarts shares when the tailnet recovers
 - **Native desktop app** (Electron) with a tray icon, plus a plain browser dashboard
 
@@ -45,8 +46,10 @@ to it. The dashboard polls `/api/state` and renders everything client-side.
 Grab the latest **Windows `.exe`** or **macOS `.dmg`** from the
 [Releases page](https://github.com/sasha-thecornerspore-dev/switchboard/releases).
 
-> **Prerequisite:** [Tailscale](https://tailscale.com/download) must be installed
-> and signed in. Public sharing requires Funnel to be enabled for your tailnet.
+> **Tailscale** is required to publish shares. You don't have to install it first —
+> if it's missing, Switchboard shows an **Install Tailscale** button (winget on
+> Windows, Homebrew on macOS) and a **Sign in** prompt once it's installed. Public
+> sharing additionally requires Funnel to be enabled for your tailnet.
 
 ### Run from source
 
