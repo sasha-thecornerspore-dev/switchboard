@@ -162,6 +162,20 @@ http.createServer((req, res) => {
       if (!pathname.endsWith("/")) {
         res.writeHead(301, { Location: pathname + "/" }); res.end(); return;
       }
+      // Default document: if the folder has an index.html/index.htm, serve it
+      // as a webpage instead of a file listing. This lets a share host a static
+      // website (HTML/CSS/JS) at its root URL. Folders without an index still
+      // show the directory listing (the deliverables-sharing use case).
+      for (const idx of ["index.html", "index.htm"]) {
+        const ip = path.join(filePath, idx);
+        let ist; try { ist = fs.statSync(ip); } catch { ist = null; }
+        if (ist && ist.isFile()) {
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": ist.size, "Cache-Control": "no-store" });
+          fs.createReadStream(ip).pipe(res);
+          logHit({method:req.method, path:pathname + idx, status:200, bytes:ist.size, mime:"text/html", kind:"index", ip:req.socket.remoteAddress, ua:req.headers["user-agent"]||""});
+          return;
+        }
+      }
       const html = listingHtml(pathname, filePath);
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
       res.end(html);
