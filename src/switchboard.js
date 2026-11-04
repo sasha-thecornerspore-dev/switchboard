@@ -37,9 +37,58 @@ let state = {
   tailnetHost: null,           // e.g. my-host.tailXXXX.ts.net
   tailnetIPv4: null,           // e.g. 100.x.x.x
   backendState: "Unknown",     // Tailscale BackendState: Running | Stopped | Starting | NeedsLogin | Unreachable
-  shares: [],                  // [{id, name, root, localPort, tailscalePort, mode, pid, logFile, createdAt}]
+  lanIPv4: null,               // best-guess LAN address of this machine (for proxy origins)
+  shares: [],                  // [{id, name, root, localPort, tailscalePort, mode, method, bind, proxyHost, pid, logFile, createdAt}]
   recentHits: [],              // last 50 hits across all shares
 };
+
+// ============================== PUBLISH METHODS ==============================
+// Each share is published one of three ways:
+//   tailscale — tailscale serve/funnel fronts the local share-server (the
+//               original behaviour; `mode` picks tailnet-only vs public Funnel)
+//   proxy     — Switchboard only runs the share-server; YOUR reverse proxy
+//               (nginx / Apache / OPNsense os-nginx) fronts it. The dashboard
+//               hands you ready-to-paste config for the origin it's listening on.
+//   local     — just the share-server on localhost/LAN, nothing published.
+// `bind` is the share-server listen address: 127.0.0.1 (same-machine proxy or
+// Tailscale) or 0.0.0.0 (LAN — required for a proxy on another box).
+const METHODS = ["tailscale", "proxy", "local"];
+const BIND_LOCAL = "127.0.0.1";
+const BIND_LAN = "0.0.0.0";
+function normalizeShare(s) {
+  if (!METHODS.includes(s.method)) s.method = "tailscale";   // pre-method configs are Tailscale shares
+  s.bind = s.bind === BIND_LAN ? BIND_LAN : BIND_LOCAL;
+  if (typeof s.proxyHost !== "string") s.proxyHost = "";
+  if (!["public", "tailnet"].includes(s.mode)) s.mode = "tailnet";
+  return s;
+}
+function usesTailscale(s) { return s.method === "tailscale"; }
+
+// Interfaces that carry an IPv4 but are useless as a proxy origin: Hyper-V /
+// WSL virtual switches, VM host adapters, Docker bridges, Tailscale itself.
+const VIRTUAL_IFACE = /vEthernet|WSL|Hyper-V|Default Switch|VirtualBox|VMware|vmnet|docker|^br-|^veth|Loopback|Tailscale|ZeroTier|Npcap|Bluetooth|utun|tun\d|tap\d/i;
+function detectLanIPv4() {
+  const cands = [];
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    for (const a of addrs || []) {
+      if (a.family !== "IPv4" && a.family !== 4) continue;
+      if (a.internal) continue;
+      const ip = a.address;
+      if (ip.startsWith("169.254.")) continue;                                   // link-local
+      if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip)) continue;        // CGNAT = Tailscale
+      const virt = VIRTUAL_IFACE.test(name);
+      const priv = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip);
+      cands.push({ ip, score: (virt ? 0 : 10) + (priv ? 5 : 0) });
+    }
+  }
+  cands.sort((a, b) => b.score - a.score);
+  return cands.length ? cands[0].ip : null;
+}
+// The exact http://HOST:PORT a reverse proxy must point at for this share.
+function originFor(s) {
+  const host = s.bind === BIND_LAN ? (state.lanIPv4 || "<this-machine-LAN-IP>") : "127.0.0.1";
+  return `http://${host}:${s.localPort}`;
+}
 
 const PORT_RANGE = { local: { start: 18650, end: 18799 }, tailscale: { public: [443], private: [8443, 10000] } };
 
@@ -63,7 +112,7 @@ function nextTailscalePort(mode, hasPathToken = false) {
 function loadConfig() {
   try {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-    state.shares = cfg.shares || [];
+    state.shares = (cfg.shares || []).map(normalizeShare);
     console.log(`Loaded ${state.shares.length} share(s) from config`);
   } catch { /* fresh start */ }
 }
@@ -217,6 +266,7 @@ function detectTailscaleInstalled() {
 }
 
 async function refreshTailscale() {
+  state.lanIPv4 = detectLanIPv4();
   state.tailscaleInstalled = detectTailscaleInstalled();
   if (!state.tailscaleInstalled) {
     state.backendState = "NotInstalled";
@@ -284,11 +334,14 @@ async function tailscaleUp() {
 // whenever the tailnet is healthy. Guarded so ticks never overlap.
 let reconciling = false;
 async function reconcileShares() {
-  if (reconciling || state.backendState !== "Running") return;
+  if (reconciling) return;
   reconciling = true;
   try {
     for (const s of state.shares) {
       if (s.paused || s.pid) continue;
+      // Tailscale shares can only come back once the tailnet is healthy; proxy
+      // and local shares don't depend on it at all.
+      if (usesTailscale(s) && state.backendState !== "Running") continue;
       try {
         await startShare(s);
         s.lastError = null;
@@ -303,6 +356,7 @@ async function applyTailscaleForShare(s) {
   // the error to the UI instead of leaving the share "running" with no actual
   // public/tailnet route. Previously this swallowed errors via .catch(console.error)
   // which is exactly how Funnel paths ended up pointing at dead ports silently.
+  if (!usesTailscale(s)) return;   // proxy/local shares have no Tailscale route
   const target = `http://localhost:${s.localPort}`;
   const pathArg = s.pathToken ? `--set-path=/${s.pathToken}` : "";
   const cmd = s.mode === "public"
@@ -320,6 +374,7 @@ async function applyTailscaleForShare(s) {
 async function removeTailscaleForShare(s) {
   // We don't blanket-disable the port because other shares may use it via different paths.
   // tailscale serve reset would nuke everything; instead just remove our specific entry.
+  if (!usesTailscale(s)) return;
   const pathArg = s.pathToken ? `--set-path=/${s.pathToken}` : "";
   if (s.mode === "public") {
     await ts(`funnel --https=${s.tailscalePort} ${pathArg} off`).catch(()=>{});
@@ -328,8 +383,23 @@ async function removeTailscaleForShare(s) {
 }
 
 // ============================== SHARE LIFECYCLE ==============================
+// Badge + footer the share-server shows on its directory listing, so a share
+// never claims "tailnet-only" when it's actually on the LAN or behind a proxy.
+function shareLabels(s) {
+  if (s.method === "proxy") return { badge: "VIA REVERSE PROXY", footer: `Hosted via Switchboard behind ${s.proxyHost || "your reverse proxy"}` };
+  if (s.method === "local") return s.bind === BIND_LAN
+    ? { badge: "LOCAL NETWORK", footer: "Hosted via Switchboard · Visible only on your local network" }
+    : { badge: "THIS MACHINE ONLY", footer: "Hosted via Switchboard · Visible only on this machine" };
+  if (s.mode === "public") return { badge: "PUBLIC · TAILSCALE FUNNEL", footer: "Hosted via Tailscale Funnel" };
+  return { badge: "PRIVATE · TAILNET-ONLY", footer: "Hosted via Tailscale Serve · Visible only to your tailnet" };
+}
+
 function spawnShareServer(s) {
   const env = { ...process.env };
+  env.SHARE_BIND = s.bind || BIND_LOCAL;
+  const labels = shareLabels(s);
+  env.SHARE_BADGE = labels.badge;
+  env.SHARE_FOOTER = labels.footer;
   if (s.auth && s.auth.user && s.auth.pass) {
     env.SHARE_AUTH_USER = s.auth.user;
     env.SHARE_AUTH_PASS = s.auth.pass;
@@ -463,6 +533,16 @@ function waitForLocalPortFree(port, timeoutMs = 2500) {
   });
 }
 
+// Stop + start the share-server only (no Tailscale changes) so it picks up new
+// env (bind address, auth, labels). Throws if it doesn't come back up.
+async function respawnShareServer(s) {
+  killShareServer(s);
+  await waitForLocalPortFree(s.localPort, 2500);
+  spawnShareServer(s);
+  const up = await waitForLocalPort(s.localPort, 4000);
+  if (!up) { killShareServer(s); throw new Error(`share-server for "${s.name}" did not come up on :${s.localPort}`); }
+}
+
 async function stopShare(s) {
   killShareServer(s);
   // Best-effort wait for the child to release its port before tailscale teardown
@@ -527,10 +607,12 @@ async function handleApi(req, res, parsed, me) {
       running: !!s.pid,
       perm: grantFor(me, s.id),          // "view" | "manage"
       stats: statsFor(s),
-      urls: buildUrls(s)
+      urls: buildUrls(s),
+      origin: originFor(s),
+      proxyConfigs: s.method === "proxy" ? proxyConfigsFor(s) : undefined
     }));
     return send(res, 200, {
-      tailnetHost: state.tailnetHost, tailnetIPv4: state.tailnetIPv4,
+      tailnetHost: state.tailnetHost, tailnetIPv4: state.tailnetIPv4, lanIPv4: state.lanIPv4,
       backendState: state.backendState, tailscaleInstalled: state.tailscaleInstalled !== false,
       me: publicUser(me), isAdmin: isAdmin(me),
       shares: sharesOut
@@ -609,15 +691,20 @@ async function handleApi(req, res, parsed, me) {
     const body = await readBody(req);
     if (!body.name || !body.root) return send(res, 400, { error: "name + root required" });
     const id = "s" + Date.now().toString(36);
-    const s = {
+    const s = normalizeShare({
       id, name: body.name, root: body.root,
       localPort: nextLocalPort(),
       tailscalePort: nextTailscalePort(body.mode || "tailnet"),
       mode: body.mode || "tailnet",
+      method: body.method,
+      bind: body.bind,
+      proxyHost: body.proxyHost,
       pid: null,
       logFile: path.join(LOG_DIR, `${id}.jsonl`),
       createdAt: new Date().toISOString()
-    };
+    });
+    // A share published through a proxy on another box must listen on the LAN.
+    if (s.method === "proxy" && body.bind === undefined) s.bind = BIND_LAN;
     try {
       await startShare(s);
       state.shares.push(s); saveConfig();
@@ -641,9 +728,66 @@ async function handleApi(req, res, parsed, me) {
       return send(res, 200, { ok: true });
     }
 
+    // Publish method: tailscale | proxy | local, plus the share-server bind
+    // address and (for proxy) the public hostname your proxy answers on.
+    // Any subset of {method, bind, proxyHost} may be sent.
+    if (sub === "publish" && req.method === "POST") {
+      const b = await readBody(req);
+      const prev = { method: s.method, bind: s.bind, proxyHost: s.proxyHost, tailscalePort: s.tailscalePort, pathToken: s.pathToken };
+      const next = { method: s.method, bind: s.bind, proxyHost: s.proxyHost };
+      if (b.method !== undefined) {
+        if (!METHODS.includes(b.method)) return send(res, 400, { error: "bad method — use tailscale, proxy or local" });
+        next.method = b.method;
+      }
+      if (b.bind !== undefined) next.bind = (b.bind === BIND_LAN || b.bind === "lan") ? BIND_LAN : BIND_LOCAL;
+      if (b.proxyHost !== undefined) {
+        next.proxyHost = String(b.proxyHost).trim().replace(/^https?:\/\//i, "").replace(/[\/:].*$/, "").toLowerCase();
+      }
+      // Switching TO proxy without an explicit bind: a proxy on another box
+      // (OPNsense) can only reach a LAN-bound origin, so enable LAN.
+      if (next.method === "proxy" && prev.method !== "proxy" && b.bind === undefined) next.bind = BIND_LAN;
+
+      const methodChanged = next.method !== prev.method;
+      const bindChanged = next.bind !== prev.bind;
+      if (!methodChanged && !bindChanged) {
+        s.proxyHost = next.proxyHost;
+        if (!s.paused && s.pid && s.method !== "tailscale") {
+          // Footer text names the proxy host — refresh it, best-effort.
+          try { await respawnShareServer(s); } catch (e) { s.lastError = e.message; }
+        }
+        saveConfig();
+        return send(res, 200, { ok: true, share: s });
+      }
+
+      // Leaving Tailscale: drop the serve/funnel route first (uses OLD fields).
+      if (methodChanged && prev.method === "tailscale") await removeTailscaleForShare(s);
+      Object.assign(s, next);
+      const rollback = async (err) => {
+        Object.assign(s, { method: prev.method, bind: prev.bind, proxyHost: prev.proxyHost, tailscalePort: prev.tailscalePort, pathToken: prev.pathToken });
+        if (!s.paused) {
+          try { await respawnShareServer(s); await applyTailscaleForShare(s); } catch (e2) { s.lastError = e2.message; }
+        }
+        return send(res, 500, { error: err.message });
+      };
+      if (!s.paused) {
+        if (bindChanged || !s.pid) {
+          try { await respawnShareServer(s); } catch (e) { return rollback(e); }
+        }
+        if (methodChanged && s.method === "tailscale") {
+          if (s.mode === "public" && s.auth && !s.pathToken) s.pathToken = genToken(10);
+          s.tailscalePort = nextTailscalePort(s.mode, !!s.pathToken);
+          try { await applyTailscaleForShare(s); } catch (e) { return rollback(e); }
+        }
+      }
+      s.lastError = null;
+      saveConfig();
+      return send(res, 200, { ok: true, share: s });
+    }
+
     if (sub === "mode" && req.method === "POST") {
       const { mode } = await readBody(req);
       if (!["public", "tailnet"].includes(mode)) return send(res, 400, { error: "bad mode" });
+      if (!usesTailscale(s)) return send(res, 400, { error: "Public/Tailnet only applies to Tailscale-published shares — switch the publish method first" });
       if (mode === s.mode) return send(res, 200, { ok: true });
       const prevMode = s.mode;
       const prevPort = s.tailscalePort;
@@ -770,11 +914,22 @@ async function handleApi(req, res, parsed, me) {
 }
 
 function buildUrls(s) {
+  const urls = [];
+  if (s.method === "proxy") {
+    if (s.proxyHost) urls.push({ label: "Public (via proxy)", url: `https://${s.proxyHost}/`, primary: true });
+    urls.push({ label: "Origin", url: originFor(s) + "/", primary: !s.proxyHost,
+      note: s.bind === BIND_LAN ? "Point your reverse proxy here" : "Same-machine proxy only — flip to LAN for OPNsense" });
+    return urls;
+  }
+  if (s.method === "local") {
+    urls.push({ label: "This machine", url: `http://127.0.0.1:${s.localPort}/`, primary: true });
+    if (s.bind === BIND_LAN) urls.push({ label: "LAN", url: originFor(s) + "/", note: "Other devices on your network" });
+    return urls;
+  }
   const host = state.tailnetHost || "your-tailnet.ts.net";
   const ip = state.tailnetIPv4 || "100.x.x.x";
   const portSeg = s.tailscalePort === 443 ? "" : `:${s.tailscalePort}`;
   const pathSeg = s.pathToken ? `/${s.pathToken}/` : "/";
-  const urls = [];
   if (s.mode === "public") {
     urls.push({ label: "Public (internet)", url: `https://${host}${portSeg}${pathSeg}`, primary: true });
   } else {
@@ -783,6 +938,116 @@ function buildUrls(s) {
     urls.push({ label: "Tailnet · IPv4", url: `https://${ip}${portSeg}${pathSeg}`, note: "Use if MagicDNS is flaky" });
   }
   return urls;
+}
+
+// Ready-to-paste reverse-proxy config for a proxy-published share. Built with
+// plain string joins (not template literals) because nginx/Apache syntax is
+// full of $variables. Basic auth is enforced by the share-server itself, so the
+// proxy only has to pass the Authorization header through — all three do by
+// default; the nginx/Apache snippets make it explicit.
+function proxyConfigsFor(s) {
+  const host = s.proxyHost || "files.example.com";
+  const origin = originFor(s);
+  const originHost = s.bind === BIND_LAN ? (state.lanIPv4 || "<this-machine-LAN-IP>") : "127.0.0.1";
+  const slug = (s.name || "share").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "share";
+  const nginx = [
+    "# nginx — reverse proxy for Switchboard share \"" + s.name + "\"",
+    "# Origin: " + origin + "   (share-server bound to " + s.bind + ")",
+    "server {",
+    "    listen 443 ssl http2;",
+    "    server_name " + host + ";",
+    "",
+    "    # TLS — e.g. certbot/acme output for " + host,
+    "    ssl_certificate     /etc/letsencrypt/live/" + host + "/fullchain.pem;",
+    "    ssl_certificate_key /etc/letsencrypt/live/" + host + "/privkey.pem;",
+    "",
+    "    location / {",
+    "        proxy_pass " + origin + ";",
+    "        proxy_http_version 1.1;",
+    "        proxy_set_header Host              $host;",
+    "        proxy_set_header X-Real-IP         $remote_addr;",
+    "        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;",
+    "        proxy_set_header X-Forwarded-Proto $scheme;",
+    "        # Switchboard enforces its own Basic auth — pass it straight through",
+    "        proxy_set_header Authorization     $http_authorization;",
+    "        proxy_pass_header WWW-Authenticate;",
+    "        client_max_body_size 0;",
+    "        proxy_buffering off;",
+    "    }",
+    "}",
+    "",
+    "server {",
+    "    listen 80;",
+    "    server_name " + host + ";",
+    "    return 301 https://$host$request_uri;",
+    "}",
+  ].join("\n");
+
+  const apache = [
+    "# Apache — reverse proxy for Switchboard share \"" + s.name + "\"",
+    "# Origin: " + origin + "   (share-server bound to " + s.bind + ")",
+    "# Requires: a2enmod proxy proxy_http ssl headers rewrite",
+    "<VirtualHost *:443>",
+    "    ServerName " + host,
+    "",
+    "    SSLEngine on",
+    "    SSLCertificateFile    /etc/letsencrypt/live/" + host + "/fullchain.pem",
+    "    SSLCertificateKeyFile /etc/letsencrypt/live/" + host + "/privkey.pem",
+    "",
+    "    ProxyPreserveHost On",
+    "    ProxyRequests Off",
+    "    ProxyPass        / " + origin + "/",
+    "    ProxyPassReverse / " + origin + "/",
+    "    RequestHeader set X-Forwarded-Proto \"https\"",
+    "    # Switchboard enforces its own Basic auth — mod_proxy forwards the",
+    "    # Authorization header by default; nothing to add here.",
+    "</VirtualHost>",
+    "",
+    "<VirtualHost *:80>",
+    "    ServerName " + host,
+    "    RewriteEngine On",
+    "    RewriteRule ^(.*)$ https://" + host + "$1 [R=301,L]",
+    "</VirtualHost>",
+  ].join("\n");
+
+  const opnsense = [
+    "OPNsense → Services → Nginx  (os-nginx plugin, form-based — fill these in order)",
+    "Share: " + s.name + "   Origin: " + origin,
+    (s.bind === BIND_LAN ? "" : "⚠ Origin is on 127.0.0.1 — OPNsense can't reach it. Flip the origin pill to LAN first.\n"),
+    "1. HTTP(S) → Upstream Server → +",
+    "     Description:  sb-" + slug,
+    "     Server:       " + originHost,
+    "     Port:         " + s.localPort,
+    "     Priority:     1",
+    "",
+    "2. HTTP(S) → Upstream → +",
+    "     Description:    sb-" + slug,
+    "     Server Entries: sb-" + slug,
+    "     (leave TLS: Enable off — the origin is plain http)",
+    "",
+    "3. HTTP(S) → Location → +",
+    "     Description:      sb-" + slug + "-root",
+    "     URL Pattern:      /",
+    "     Upstream Servers: sb-" + slug,
+    "     Force HTTPS:      on",
+    "     (no Basic-auth settings here — the share enforces its own; the",
+    "      Authorization header is proxied through untouched)",
+    "",
+    "4. HTTP(S) → HTTP Server → +",
+    "     HTTP Listen Address:   80",
+    "     HTTPS Listen Address:  443",
+    "     Server Name:           " + host,
+    "     Locations:             sb-" + slug + "-root",
+    "     TLS Certificate:       certificate for " + host + " (ACME plugin or imported)",
+    "     HTTPS Only:            on",
+    "",
+    "5. Services → Nginx → Configuration → Apply.",
+    "   Then: public DNS A record " + host + " → your WAN IP, and Firewall → NAT →",
+    "   Port Forward WAN 443 (and 80) → OPNsense itself (or a WAN pass rule if",
+    "   nginx binds the WAN address directly).",
+  ].join("\n");
+
+  return { nginx, apache, opnsense };
 }
 
 // ============================== UI ==============================
@@ -952,6 +1217,35 @@ h2.section{font-size:14px;letter-spacing:.12em;text-transform:uppercase;color:rg
 .toggle-mode{display:flex;background:rgba(0,0,0,.25);border-radius:999px;padding:3px;border:1px solid var(--line);font-size:12px;}
 .toggle-mode button{background:transparent;color:rgba(255,255,255,.6);border:none;padding:6px 12px;border-radius:999px;cursor:pointer;font-family:inherit;font-weight:600;}
 .toggle-mode button.active{background:var(--amber);color:var(--navy);}
+.toggle-mode button.active.proxy{background:#6c8cc8;color:#fff;}
+.toggle-mode button.active.local{background:var(--green);color:#fff;}
+.toggle-mode button:disabled{opacity:.45;cursor:default;}
+.badge-proxy{background:rgba(108,140,200,.22);color:#bcd0f5;}
+.badge-local{background:rgba(43,174,102,.15);color:#7be3a4;}
+
+/* Publish-method config panel (proxy / local) */
+.pub-panel{background:rgba(108,140,200,.08);border:1px solid rgba(108,140,200,.35);border-radius:12px;padding:12px;margin-bottom:14px;}
+.pub-panel.local{background:rgba(43,174,102,.07);border-color:rgba(43,174,102,.3);}
+.pub-head{display:flex;justify-content:space-between;align-items:center;font-size:12px;font-weight:700;color:#bcd0f5;margin-bottom:8px;letter-spacing:.04em;}
+.pub-panel.local .pub-head{color:#7be3a4;}
+.pub-row{display:flex;align-items:center;gap:8px;font-size:12px;padding:4px 0;flex-wrap:wrap;}
+.pub-lbl{color:rgba(255,255,255,.5);width:70px;text-transform:uppercase;font-size:10px;letter-spacing:.08em;font-weight:600;flex-shrink:0;}
+.pub-row code{flex:1;min-width:160px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;background:rgba(0,0,0,.3);padding:4px 8px;border-radius:6px;color:white;user-select:all;word-break:break-all;}
+.pub-row input{flex:1;min-width:160px;background:rgba(0,0,0,.3);border:1px solid var(--line);color:white;padding:5px 8px;border-radius:6px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;}
+.pub-row input:focus{outline:none;border-color:var(--amber);}
+.pill{display:inline-flex;background:rgba(0,0,0,.3);border-radius:999px;padding:2px;border:1px solid var(--line);font-size:10px;}
+.pill button{background:transparent;color:rgba(255,255,255,.6);border:none;padding:3px 9px;border-radius:999px;cursor:pointer;font-family:inherit;font-weight:700;letter-spacing:.04em;}
+.pill button.active{background:var(--amber);color:var(--navy);}
+.pub-note{font-size:11px;color:rgba(255,255,255,.55);margin-top:6px;line-height:1.4;}
+.pub-note b{color:var(--amber);}
+.cfg-tabs{display:flex;gap:4px;margin:10px 0 6px;border-bottom:1px solid var(--line);}
+.cfg-tabs button{background:transparent;border:none;color:rgba(255,255,255,.55);padding:6px 10px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;border-bottom:2px solid transparent;margin-bottom:-1px;letter-spacing:.04em;}
+.cfg-tabs button.active{color:var(--amber);border-bottom-color:var(--amber);}
+.cfg-tabs .sp{flex:1;}
+.cfg-tabs .copy{background:rgba(255,255,255,.08);border:none;color:white;padding:4px 10px;border-radius:6px;font-size:11px;cursor:pointer;font-family:inherit;align-self:center;margin-bottom:4px;}
+.cfg-tabs .copy:hover{background:var(--amber);color:var(--navy);}
+.cfg-tabs .copy.copied{background:var(--green);color:white;}
+.cfg{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:10.5px;line-height:1.45;color:rgba(255,255,255,.85);background:rgba(0,0,0,.35);border-radius:8px;padding:10px;max-height:220px;overflow:auto;white-space:pre;margin:0;}
 
 .share-extras{margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:14px;}
 .qr-wrap{background:white;border-radius:12px;padding:10px;display:flex;align-items:center;justify-content:center;}
@@ -1308,9 +1602,57 @@ async function delShare(id, name) {
 }
 
 async function toggleMode(id, mode) {
-  await api('POST', '/api/shares/'+id+'/mode', { mode });
+  const r = await api('POST', '/api/shares/'+id+'/mode', { mode });
+  if (r && r.error) { toast('Error: ' + r.error); return; }
   toast('Switched to ' + mode);
   refresh();
+}
+
+// ——— Publish method (Tailscale / Proxy / Local) ————————————————————————
+const PROXY_TAB = {};   // shareId -> 'nginx' | 'apache' | 'opnsense' (survives re-renders)
+function esc(s) {
+  return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+const METHOD_LABEL = { tailscale: 'Tailscale', proxy: 'Reverse proxy', local: 'Local only' };
+async function setMethod(id, method) {
+  const s = (LAST_DATA && LAST_DATA.shares || []).find(function(x){ return x.id === id; });
+  if (s && (s.method || 'tailscale') === method) return;
+  toast('Switching to ' + METHOD_LABEL[method] + '…');
+  const r = await api('POST', '/api/shares/'+id+'/publish', { method: method });
+  if (r && r.error) { toast('Error: ' + r.error); refresh(); return; }
+  toast('Published via ' + METHOD_LABEL[method] + (method === 'proxy' && r.share && r.share.bind === '0.0.0.0' ? ' — origin now on LAN' : ''));
+  if (method !== 'local') bamfloozle(40);
+  refresh();
+}
+async function setBind(id, bind) {
+  const s = (LAST_DATA && LAST_DATA.shares || []).find(function(x){ return x.id === id; });
+  if (s && s.bind === bind) return;
+  const r = await api('POST', '/api/shares/'+id+'/publish', { bind: bind });
+  if (r && r.error) { toast('Error: ' + r.error); refresh(); return; }
+  toast(bind === '0.0.0.0' ? 'Origin now listening on the LAN' : 'Origin now localhost-only');
+  refresh();
+}
+async function saveProxyHost(id, el) {
+  const s = (LAST_DATA && LAST_DATA.shares || []).find(function(x){ return x.id === id; });
+  const v = (el.value || '').trim();
+  if (s && (s.proxyHost || '') === v) return;
+  const r = await api('POST', '/api/shares/'+id+'/publish', { proxyHost: v });
+  if (r && r.error) { toast('Error: ' + r.error); return; }
+  toast(v ? 'Hostname saved: ' + (r.share && r.share.proxyHost || v) : 'Hostname cleared');
+  refresh();
+}
+function setProxyTab(id, tab) {
+  PROXY_TAB[id] = tab;
+  if (LAST_DATA) renderShares(LAST_DATA);
+}
+function copyCfg(id, btn) {
+  const s = (LAST_DATA && LAST_DATA.shares || []).find(function(x){ return x.id === id; });
+  const tab = PROXY_TAB[id] || 'nginx';
+  const txt = s && s.proxyConfigs && s.proxyConfigs[tab];
+  if (!txt) { toast('Nothing to copy yet'); return; }
+  navigator.clipboard.writeText(txt).then(function(){
+    if (btn) { const old = btn.textContent; btn.textContent = '✓ Copied'; btn.classList.add('copied'); setTimeout(function(){ btn.textContent = old; btn.classList.remove('copied'); }, 1500); }
+  });
 }
 
 async function pauseShare(id) {
@@ -1400,9 +1742,55 @@ function shareCard(s) {
     '<div class="row"><span class="p">' + (h.path||'') + '</span><span class="s">' + fmtTime(h.t) + '</span></div>'
   ).join('') || '<div style="color:var(--gray-2);text-align:center;padding:14px;">No requests yet</div>';
 
-  const badgeText = s.paused ? '⏸ PAUSED' : (s.mode==='public' ? (s.auth?'🌐🔐 PUBLIC + AUTH':'🌐 PUBLIC') : '🔒 TAILNET');
-  const badgeClass = s.paused ? 'badge-paused' : (s.mode==='public' ? (s.auth?'badge-mix':'badge-pub') : 'badge-priv');
+  const method = s.method || 'tailscale';
+  const lock = s.auth ? '🔐 ' : '';
+  let badgeText, badgeClass;
+  if (s.paused) { badgeText = '⏸ PAUSED'; badgeClass = 'badge-paused'; }
+  else if (method === 'proxy') { badgeText = '🔀 ' + lock + 'PROXY'; badgeClass = 'badge-proxy'; }
+  else if (method === 'local') { badgeText = '🏠 ' + lock + (s.bind === '0.0.0.0' ? 'LAN' : 'LOCAL'); badgeClass = 'badge-local'; }
+  else if (s.mode === 'public') { badgeText = s.auth ? '🌐🔐 PUBLIC + AUTH' : '🌐 PUBLIC'; badgeClass = s.auth ? 'badge-mix' : 'badge-pub'; }
+  else { badgeText = '🔒 TAILNET'; badgeClass = 'badge-priv'; }
   const viewBadge = !canManage ? '<span class="badge badge-view" title="You have view-only access">👁 VIEW ONLY</span>' : '';
+
+  // Publish-method config panel: proxy gets origin + hostname + config tabs,
+  // local just gets the localhost/LAN bind pill.
+  const lan = s.bind === '0.0.0.0';
+  const bindPill = canManage
+    ? '<span class="pill">' +
+        '<button class="' + (!lan?'active':'') + '" onclick="setBind(\\''+s.id+'\\', \\'127.0.0.1\\')" title="Only this machine (or a proxy running on it) can reach the origin">localhost</button>' +
+        '<button class="' + (lan?'active':'') + '" onclick="setBind(\\''+s.id+'\\', \\'0.0.0.0\\')" title="Listen on all interfaces so other LAN devices / OPNsense can reach it">LAN 0.0.0.0</button>' +
+      '</span>'
+    : '<span class="pill"><button class="active" disabled>' + (lan ? 'LAN 0.0.0.0' : 'localhost') + '</button></span>';
+  let pubHtml = '';
+  if (method === 'proxy') {
+    const tab = PROXY_TAB[s.id] || 'nginx';
+    const cfgs = s.proxyConfigs || {};
+    pubHtml = '<div class="pub-panel">' +
+      '<div class="pub-head"><span>🔀 Reverse proxy</span><span style="font-weight:500;opacity:.7;">your nginx / Apache / OPNsense fronts this origin</span></div>' +
+      '<div class="pub-row"><span class="pub-lbl">Origin</span><code>' + esc(s.origin || '') + '</code><button class="copy" onclick="copy(\\''+esc(s.origin||'')+'\\', this)" style="background:rgba(255,255,255,.08);border:none;color:white;padding:4px 10px;border-radius:6px;font-size:11px;cursor:pointer;font-family:inherit;">Copy</button>' + bindPill + '</div>' +
+      '<div class="pub-row"><span class="pub-lbl">Hostname</span>' +
+        (canManage
+          ? '<input id="ph-' + s.id + '" value="' + esc(s.proxyHost||'') + '" placeholder="files.example.com" onkeydown="if(event.key===\\'Enter\\'){this.blur();}" onblur="saveProxyHost(\\''+s.id+'\\', this)">'
+          : '<code>' + esc(s.proxyHost || '—') + '</code>') +
+      '</div>' +
+      (!lan ? '<div class="pub-note">Origin is on <b>localhost</b> — fine if nginx/Apache runs on this PC. For <b>OPNsense</b> or any other box, flip it to <b>LAN</b>.</div>' : '') +
+      '<div class="cfg-tabs">' +
+        ['nginx','apache','opnsense'].map(function(t){
+          const lbl = t === 'nginx' ? 'nginx' : (t === 'apache' ? 'Apache' : 'OPNsense');
+          return '<button class="' + (tab===t?'active':'') + '" onclick="setProxyTab(\\''+s.id+'\\', \\''+t+'\\')">' + lbl + '</button>';
+        }).join('') +
+        '<span class="sp"></span><button class="copy" onclick="copyCfg(\\''+s.id+'\\', this)">Copy ' + (tab==='opnsense'?'steps':'config') + '</button>' +
+      '</div>' +
+      '<pre class="cfg">' + esc(cfgs[tab] || '') + '</pre>' +
+    '</div>';
+  } else if (method === 'local') {
+    pubHtml = '<div class="pub-panel local">' +
+      '<div class="pub-head"><span>🏠 Local only</span><span style="font-weight:500;opacity:.7;">nothing published</span></div>' +
+      '<div class="pub-row"><span class="pub-lbl">Listen</span><code>' + esc(s.origin || '') + '</code>' + bindPill + '</div>' +
+      (lan ? '<div class="pub-note">Reachable from any device on your <b>local network</b> at the LAN URL above.</div>'
+           : '<div class="pub-note">Only <b>this machine</b> can open it. Flip to LAN to let other devices on your network in.</div>') +
+    '</div>';
+  }
 
   return '<div class="share' + (s.paused?' paused':'') + '" data-id="' + s.id + '">' +
     '<div class="share-head">' +
@@ -1413,6 +1801,7 @@ function shareCard(s) {
       (s.paused ? '<div class="paused-note">⏸ Paused — the URLs below are inactive until you resume this share.</div>' : '') +
       (!s.paused && !s.running && s.lastError ? '<div class="share-error">⚠ Not running: ' + s.lastError + ' <em style="opacity:.7">(auto-retries every 30s)</em></div>' : '') +
       '<div class="urls">' + urlsHtml + '</div>' +
+      pubHtml +
       credsHtml +
       '<div class="share-stats">' +
         '<div class="share-stat"><div class="l">Hits</div><div class="v">' + s.stats.totalHits + '</div></div>' +
@@ -1426,10 +1815,17 @@ function shareCard(s) {
       '</div>' +
       '<div class="share-actions">' +
         (canManage
-          ? '<div class="toggle-mode">' +
-              '<button class="' + (s.mode==='public'?'active':'') + '" onclick="toggleMode(\\''+s.id+'\\', \\'public\\')">🌐 Public</button>' +
-              '<button class="' + (s.mode==='tailnet'?'active':'') + '" onclick="toggleMode(\\''+s.id+'\\', \\'tailnet\\')">🔒 Tailnet</button>' +
-            '</div>'
+          ? '<div class="toggle-mode" title="Publish method">' +
+              '<button class="' + (method==='tailscale'?'active':'') + '" onclick="setMethod(\\''+s.id+'\\', \\'tailscale\\')" title="tailscale serve / funnel">🔗 Tailscale</button>' +
+              '<button class="' + (method==='proxy'?'active proxy':'') + '" onclick="setMethod(\\''+s.id+'\\', \\'proxy\\')" title="Your own reverse proxy (nginx / Apache / OPNsense)">🔀 Proxy</button>' +
+              '<button class="' + (method==='local'?'active local':'') + '" onclick="setMethod(\\''+s.id+'\\', \\'local\\')" title="localhost / LAN only, nothing published">🏠 Local</button>' +
+            '</div>' +
+            (method === 'tailscale'
+              ? '<div class="toggle-mode" title="Tailscale visibility">' +
+                  '<button class="' + (s.mode==='public'?'active':'') + '" onclick="toggleMode(\\''+s.id+'\\', \\'public\\')">🌐 Public</button>' +
+                  '<button class="' + (s.mode==='tailnet'?'active':'') + '" onclick="toggleMode(\\''+s.id+'\\', \\'tailnet\\')">🔒 Tailnet</button>' +
+                '</div>'
+              : '')
           : '') +
         '<div style="margin-left:auto;display:flex;gap:8px;">' +
           (canManage ? (s.paused
@@ -1622,6 +2018,16 @@ function setHtmlIfChanged(id, html) {
   const el = document.getElementById(id);
   if (el.dataset.prev !== html) { el.innerHTML = html; el.dataset.prev = html; }
 }
+function renderShares(data) {
+  // Don't yank a card out from under someone typing a proxy hostname — a hit
+  // arriving mid-keystroke would otherwise re-render and eat their input.
+  const box = document.getElementById('shares');
+  const ae = document.activeElement;
+  if (ae && ae.tagName === 'INPUT' && box.contains(ae)) return;
+  setHtmlIfChanged('shares', data.shares.length
+    ? data.shares.map(shareCard).join('')
+    : '<div class="empty" style="grid-column:1/-1;">No shares yet. Click "+ New share" to add one.</div>');
+}
 async function refresh() {
   const data = await api('GET', '/api/state');
   if (data && data.error) {
@@ -1692,9 +2098,7 @@ async function refresh() {
   prevSums = sums;
   // Shares
   document.getElementById('count').textContent = data.shares.length + ' share' + (data.shares.length===1?'':'s');
-  setHtmlIfChanged('shares', data.shares.length
-    ? data.shares.map(shareCard).join('')
-    : '<div class="empty" style="grid-column:1/-1;">No shares yet. Click "+ New share" to add one.</div>');
+  renderShares(data);
   // Live pulse on cards that received fresh hits since last poll
   data.shares.forEach(function(s) {
     const prev = prevHitsByShare[s.id];

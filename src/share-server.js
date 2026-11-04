@@ -11,6 +11,15 @@ const NAME = process.argv[5] || path.basename(ROOT);
 const AUTH_USER = process.env.SHARE_AUTH_USER || "";
 const AUTH_PASS = process.env.SHARE_AUTH_PASS || "";
 const AUTH_REALM = (process.env.SHARE_AUTH_REALM || NAME).replace(/"/g, "");
+// Bind address. 127.0.0.1 (default) keeps the share reachable only through
+// Tailscale / a same-machine proxy; 0.0.0.0 exposes it on the LAN so a reverse
+// proxy on another box (e.g. OPNsense) can reach it. Switchboard sets this per
+// share via its "Publish method" picker.
+const BIND = process.env.SHARE_BIND || "127.0.0.1";
+// Listing badge/footer text — Switchboard passes method-appropriate labels so a
+// proxy- or LAN-published share doesn't claim to be "tailnet-only".
+const BADGE = process.env.SHARE_BADGE || "PRIVATE · TAILNET-ONLY";
+const FOOTER = process.env.SHARE_FOOTER || "Hosted via Tailscale Serve · Visible only to your tailnet";
 
 const MIME = {
   ".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
@@ -109,11 +118,11 @@ function listingHtml(reqPath, fsPath) {
   .footer{margin-top:24px;color:var(--gray);font-size:12px;text-align:center;}
 </style></head><body>
 <div class="wrap">
-  <div class="header"><div class="logo"></div><h1>${NAME}</h1><span class="private-badge">PRIVATE · TAILNET-ONLY</span></div>
+  <div class="header"><div class="logo"></div><h1>${NAME}</h1><span class="private-badge">${BADGE}</span></div>
   <div class="crumbs">${crumbs}</div>
   <table><thead><tr><th></th><th>Name</th><th style="text-align:right;">Size</th><th>Modified</th></tr></thead>
   <tbody>${rows || '<tr><td colspan="4" style="text-align:center;color:var(--gray);padding:40px;">Empty folder</td></tr>'}</tbody></table>
-  <div class="footer">Hosted via Tailscale Serve · ${items.length} item${items.length===1?'':'s'} · Visible only to your tailnet</div>
+  <div class="footer">${FOOTER} · ${items.length} item${items.length===1?'':'s'}</div>
 </div>
 </body></html>`;
 }
@@ -194,8 +203,8 @@ http.createServer((req, res) => {
     fs.createReadStream(filePath).pipe(res);
     logHit({method:req.method, path:pathname, status:200, bytes:st.size, mime, ip:req.socket.remoteAddress, ua:req.headers["user-agent"]||""});
   });
-}).listen(PORT, "127.0.0.1", () => {
-  console.log(`[${NAME}] share server listening at http://127.0.0.1:${PORT} → ${ROOT}`);
+}).listen(PORT, BIND, () => {
+  console.log(`[${NAME}] share server listening at http://${BIND}:${PORT} → ${ROOT}`);
 }).on("error", (e) => {
   // Without this handler an EADDRINUSE (port already held by an orphaned
   // share-server) throws uncaught and kills the process silently — which is

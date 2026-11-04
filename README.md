@@ -15,6 +15,9 @@ exactly the shares you choose.
 ## Features
 
 - **One-click folder sharing** over Tailscale Serve (tailnet-private) or Funnel (public internet)
+- **Three publish methods per share** — 🔗 Tailscale, 🔀 your own reverse proxy, or 🏠 local only
+  - **Reverse proxy** mode shows the exact origin your proxy must point at (localhost or LAN), a hostname field, and ready-to-paste **nginx**, **Apache**, and **OPNsense os-nginx** config with a Copy button. Password protection passes straight through.
+  - **Local** mode serves on this machine or your LAN with nothing published
 - **Multi-user accounts & profiles**
   - Admin and User roles
   - Per-share grants: each user gets **view-only** or **manage** on the specific shares you pick — the whole dashboard or just slices of it
@@ -36,8 +39,16 @@ Two small Node services, no external dependencies:
 | `src/share-server.js` | A per-share static file server (directory listing, logging, optional Basic auth). One process per active share. |
 | `main.js` / `preload.js` | The Electron desktop wrapper — spawns the service, renders the dashboard, adds a tray icon and a native folder picker. |
 
-Each share gets its own local port; Switchboard wires `tailscale serve`/`funnel`
-to it. The dashboard polls `/api/state` and renders everything client-side.
+Each share gets its own local port. How that port reaches the world is the
+share's **publish method**, switchable from its card:
+
+| Method | What Switchboard does | Origin bind |
+|--------|-----------------------|-------------|
+| 🔗 **Tailscale** (default) | Wires `tailscale serve` (tailnet) or `funnel` (public) to the port | `127.0.0.1` |
+| 🔀 **Reverse proxy** | Runs the share-server only; you point nginx / Apache / OPNsense at the origin shown on the card. Config for all three is generated for you. | `0.0.0.0` (LAN) by default, so a proxy on another box can reach it; flip to `127.0.0.1` if the proxy runs on the same PC |
+| 🏠 **Local** | Runs the share-server only, nothing published | `127.0.0.1`, or `0.0.0.0` to let LAN devices in |
+
+The dashboard polls `/api/state` and renders everything client-side.
 
 ## Install
 
