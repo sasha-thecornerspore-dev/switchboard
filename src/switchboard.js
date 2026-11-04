@@ -71,6 +71,17 @@ function normalizeShare(s) {
 }
 function usesTailscale(s) { return s.method === "tailscale"; }
 function usesCloudflare(s) { return s.method === "cloudflare"; }
+// Human-readable reason a Tailscale publish would fail right now, or null.
+// Checked before create / method-switch so the UI gets a 409 with advice
+// instead of a raw "tailscale ... failed: unexpected state" 500.
+function tailscaleBlocker() {
+  const bs = state.backendState;
+  if (bs === "Running") return null;
+  const why = bs === "NotInstalled" ? "isn't installed"
+    : bs === "NeedsLogin" ? "isn't signed in"
+    : `isn't running (state: ${bs || "unknown"})`;
+  return `Tailscale ${why} — connect it first, or publish this share via Reverse proxy, Cloudflare Tunnel, or Local instead`;
+}
 
 // ============================== SETTINGS ==============================
 // Integration credentials (Cloudflare API token, OPNsense API key) live in
@@ -482,6 +493,10 @@ function shareLabels(s) {
   return { badge: "PRIVATE · TAILNET-ONLY", footer: "Hosted via Tailscale Serve · Visible only to your tailnet" };
 }
 
+// Every share-server pid THIS instance has spawned and not yet seen exit. The
+// startup orphan sweep must never kill one of these: a share created through
+// the API in the seconds before the sweep runs isn't in state.shares yet.
+const OWN_PIDS = new Set();
 function spawnShareServer(s) {
   const env = { ...process.env };
   env.SHARE_BIND = s.bind || BIND_LOCAL;
@@ -499,16 +514,19 @@ function spawnShareServer(s) {
     { cwd: HERE, windowsHide: true, detached: false, stdio: ["ignore", "ignore", "pipe"], env });
   const myPid = child.pid;
   s.pid = myPid;
+  OWN_PIDS.add(myPid);
   if (child.stderr) child.stderr.on("data", d => console.error(`[share:${s.name}] ${String(d).trim()}`));
   // Only clear s.pid if it still matches THIS child's pid. Otherwise a quickly
   // re-spawned share (mode switch, auth change, /restart) would have its NEW
   // pid blanked by the OLD child's late-arriving exit/error event.
   child.on("error", (e) => {
     console.error(`Share ${s.name} spawn error:`, e.message);
+    OWN_PIDS.delete(myPid);
     if (s.pid === myPid) s.pid = null;
   });
   child.on("exit", (code) => {
     console.log(`Share ${s.name} (pid=${myPid}) exited code=${code}`);
+    OWN_PIDS.delete(myPid);
     if (s.pid === myPid) s.pid = null;
   });
   return child;
@@ -542,13 +560,14 @@ function sweepOrphanShareServers() {
     const ps = `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -like '*share-server.js*' } | ForEach-Object { $_.ProcessId }`;
     execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true, timeout: 8000 }, (err, stdout) => {
       if (!err && stdout) {
-        // Never sweep a share-server THIS instance already owns — a share
-        // created in the seconds between UI bind and this sweep used to get
-        // killed by its own cleanup.
+        // Never sweep a share-server THIS instance owns. state.shares covers
+        // saved shares; OWN_PIDS also covers one still being created (it
+        // joins state.shares only once startShare succeeds, and the sweep's
+        // PowerShell query can easily overlap that window).
         const ours = new Set(state.shares.map(s => s.pid).filter(Boolean));
         for (const pid of stdout.trim().split(/\s+/).filter(Boolean)) {
           const n = parseInt(pid, 10);
-          if (ours.has(n)) continue;
+          if (ours.has(n) || OWN_PIDS.has(n)) continue;
           try { process.kill(n); console.log(`Swept orphan share-server pid=${pid}`); } catch {}
         }
       }
@@ -860,11 +879,21 @@ async function handleApi(req, res, parsed, me) {
     // A share published through a proxy on another box must listen on the LAN.
     if (s.method === "proxy" && body.bind === undefined) s.bind = BIND_LAN;
     if (s.proxyHost) s.proxyHost = s.proxyHost.trim().replace(/^https?:\/\//i, "").replace(/[\/:].*$/, "").toLowerCase();
+    if (usesTailscale(s)) { const why = tailscaleBlocker(); if (why) return send(res, 409, { error: why }); }
     try {
       await startShare(s);
       state.shares.push(s); saveConfig();
       return send(res, 200, { ok: true, share: s });
-    } catch (e) { return send(res, 500, { error: e.message }); }
+    } catch (e) {
+      if (e.needsInstall) {
+        // cloudflared missing: keep the share (not live) so the card can offer
+        // the one-click install; reconcileShares brings it up afterwards.
+        s.pid = null; s.lastError = e.message;
+        state.shares.push(s); saveConfig();
+        return send(res, 200, { ok: true, share: s, warning: e.message });
+      }
+      return send(res, 500, { error: e.message });
+    }
   }
 
   const idMatch = route.match(/^shares\/([^\/]+)(\/(.+))?$/);
@@ -918,8 +947,9 @@ async function handleApi(req, res, parsed, me) {
       const prev = { method: s.method, bind: s.bind, proxyHost: s.proxyHost, tailscalePort: s.tailscalePort, pathToken: s.pathToken };
       const next = { method: s.method, bind: s.bind, proxyHost: s.proxyHost };
       if (b.method !== undefined) {
-        if (!METHODS.includes(b.method)) return send(res, 400, { error: "bad method — use tailscale, proxy or local" });
+        if (!METHODS.includes(b.method)) return send(res, 400, { error: "bad method — use tailscale, proxy, cloudflare or local" });
         next.method = b.method;
+        if (b.method === "tailscale" && s.method !== "tailscale") { const why = tailscaleBlocker(); if (why) return send(res, 409, { error: why }); }
       }
       if (b.bind !== undefined) next.bind = (b.bind === BIND_LAN || b.bind === "lan") ? BIND_LAN : BIND_LOCAL;
       if (b.proxyHost !== undefined) {
@@ -1490,9 +1520,11 @@ h2.section{font-size:14px;letter-spacing:.12em;text-transform:uppercase;color:rg
 .empty{text-align:center;padding:60px;color:rgba(255,255,255,.5);font-size:14px;}
 
 /* Modal */
-.modal-overlay{position:fixed;inset:0;background:rgba(10,23,51,.85);display:none;align-items:center;justify-content:center;backdrop-filter:blur(8px);z-index:100;}
+.modal-overlay{position:fixed;inset:0;background:rgba(10,23,51,.85);display:none;justify-content:center;overflow-y:auto;padding:24px 16px;backdrop-filter:blur(8px);z-index:100;}
 .modal-overlay.open{display:flex;}
-.modal{background:var(--navy-2);border:1px solid rgba(255,255,255,.15);border-radius:18px;padding:28px;width:90%;max-width:480px;}
+.modal{background:var(--navy-2);border:1px solid rgba(255,255,255,.15);border-radius:18px;padding:28px;width:90%;max-width:480px;margin:auto;}
+.modal .m-hint{font-size:12px;color:rgba(255,255,255,.55);margin-top:8px;line-height:1.45;min-height:17px;}
+.modal .m-hint.warn{color:var(--amber);}
 .modal h3{font-size:22px;font-weight:800;margin-bottom:6px;}
 .modal p.sub{color:rgba(255,255,255,.6);font-size:13px;margin-bottom:20px;}
 .modal label{display:block;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:rgba(255,255,255,.6);margin:14px 0 6px;font-weight:600;}
@@ -1601,6 +1633,28 @@ h2.section{font-size:14px;letter-spacing:.12em;text-transform:uppercase;color:rg
       <button class="btn btn-ghost" onclick="pickFolder()">Browse…</button>
     </div>
 
+    <label>Publish via</label>
+    <div class="mode-grid">
+      <div class="mode-card selected" id="m-meth-tailscale" onclick="setNewMethod('tailscale')">
+        <h4>🔗 Tailscale</h4>
+        <p>Serve to your tailnet, or Funnel it to the public internet.</p>
+      </div>
+      <div class="mode-card" id="m-meth-proxy" onclick="setNewMethod('proxy')">
+        <h4>🔀 Reverse proxy</h4>
+        <p>Your nginx / Apache / OPNsense fronts it. Config is generated for you.</p>
+      </div>
+      <div class="mode-card" id="m-meth-cloudflare" onclick="setNewMethod('cloudflare')">
+        <h4>☁ Cloudflare Tunnel</h4>
+        <p>Public URL through cloudflared — on your own domain once a token is set.</p>
+      </div>
+      <div class="mode-card" id="m-meth-local" onclick="setNewMethod('local')">
+        <h4>🏠 Local</h4>
+        <p>Only this machine (or your LAN). Nothing is published.</p>
+      </div>
+    </div>
+    <p class="m-hint" id="m-meth-hint"></p>
+
+    <div id="m-vis">
     <label>Visibility</label>
     <div class="mode-grid">
       <div class="mode-card" id="m-tailnet" onclick="setMode('tailnet')">
@@ -1611,6 +1665,7 @@ h2.section{font-size:14px;letter-spacing:.12em;text-transform:uppercase;color:rg
         <h4>🌐 Public (Funnel)</h4>
         <p>Anyone on the internet with the URL. Use for shipping public deliverables.</p>
       </div>
+    </div>
     </div>
 
     <div class="modal-actions">
@@ -1819,7 +1874,29 @@ function setMode(m) { MODE = m;
   document.getElementById('m-tailnet').classList.toggle('selected', m==='tailnet');
   document.getElementById('m-public').classList.toggle('selected', m==='public');
 }
-function openModal() { document.getElementById('modal').classList.add('open'); }
+// Publish method for the New share dialog. Tailscale is the default when the
+// tailnet is healthy; otherwise Local, so a box without Tailscale can still share.
+let NEW_METHOD = 'tailscale';
+const NEW_METHOD_HINT = {
+  tailscale: '',
+  proxy: 'The share-server will listen on your LAN. Point your proxy at the origin shown on the card, or push it to OPNsense from there.',
+  cloudflare: 'Starts a cloudflared quick tunnel (random trycloudflare.com link). For a stable name on your domain, add a token in Settings and set the hostname on the card.',
+  local: 'Reachable from this machine only. Flip the card\\'s bind to LAN to let other devices on your network in.'
+};
+function tailscaleDown() { return !LAST_DATA || LAST_DATA.backendState !== 'Running'; }
+function setNewMethod(m) {
+  NEW_METHOD = m;
+  ['tailscale','proxy','cloudflare','local'].forEach(function(k){ document.getElementById('m-meth-'+k).classList.toggle('selected', k===m); });
+  document.getElementById('m-vis').style.display = m === 'tailscale' ? '' : 'none';
+  var hint = NEW_METHOD_HINT[m], warn = false;
+  if (m === 'tailscale' && tailscaleDown()) { hint = 'Tailscale isn\\'t running on this machine — connect it from the banner above, or pick another method.'; warn = true; }
+  if (m === 'cloudflare' && LAST_DATA && LAST_DATA.cloudflare && !LAST_DATA.cloudflare.installed) { hint = 'cloudflared isn\\'t installed yet — the share is created but stays offline until it\\'s installed; its card offers a one-click install.'; warn = true; }
+  var h = document.getElementById('m-meth-hint'); h.textContent = hint; h.classList.toggle('warn', warn);
+}
+function openModal() {
+  setNewMethod(tailscaleDown() ? 'local' : 'tailscale');
+  document.getElementById('modal').classList.add('open');
+}
 function closeModal() { document.getElementById('modal').classList.remove('open'); }
 function toast(msg) { const t = document.getElementById('toast'); t.textContent = msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'), 2400); }
 function fmtBytes(n){const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++;}return n.toFixed(n<10&&i>0?1:0)+' '+u[i];}
@@ -1830,6 +1907,8 @@ async function api(method, url, body) {
     const r = await fetch(url, { method, headers:{'Content-Type':'application/json'}, body: body?JSON.stringify(body):undefined });
     if (!r.ok) {
       let t = ''; try { t = await r.text(); } catch {}
+      // API errors are {error: "..."} — show the message, not the JSON.
+      try { const j = JSON.parse(t); if (j && typeof j.error === 'string') return { error: j.error.slice(0, 300) }; } catch {}
       return { error: 'HTTP ' + r.status + (t ? ' — ' + t.slice(0, 200) : '') };
     }
     return r.json();
@@ -1859,13 +1938,13 @@ async function createShare() {
   const root = document.getElementById('m-path').value.trim();
   if (!name || !root) { toast('Name and path required'); return; }
   document.getElementById('m-submit').textContent = 'Creating…';
-  const r = await api('POST', '/api/shares', { name, root, mode: MODE });
+  const r = await api('POST', '/api/shares', { name, root, mode: MODE, method: NEW_METHOD });
   if (r.error) { toast('Error: '+r.error); document.getElementById('m-submit').textContent='Create share'; return; }
   closeModal();
   document.getElementById('m-name').value = '';
   document.getElementById('m-path').value = '';
   document.getElementById('m-submit').textContent='Create share';
-  toast('Share created');
+  toast(r.warning ? 'Share created — ' + r.warning : 'Share created');
   bamfloozle();
   refresh();
 }

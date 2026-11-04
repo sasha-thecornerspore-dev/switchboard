@@ -44,7 +44,8 @@ Two small Node services, no external dependencies:
 | `main.js` / `preload.js` | The Electron desktop wrapper — spawns the service, renders the dashboard, adds a tray icon and a native folder picker. |
 
 Each share gets its own local port. How that port reaches the world is the
-share's **publish method**, switchable from its card:
+share's **publish method** — picked when you create the share (the dialog defaults to
+Tailscale when the tailnet is up, otherwise Local) and switchable any time from its card:
 
 | Method | What Switchboard does | Origin bind |
 |--------|-----------------------|-------------|
