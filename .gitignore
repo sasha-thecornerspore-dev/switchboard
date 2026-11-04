@@ -7,6 +7,7 @@ out/
 # Runtime state & SECRETS — never commit these
 switchboard-config.json
 switchboard-users.json
+switchboard-settings.json
 FIRST-RUN-ADMIN-PASSWORD.txt
 logs/
 *.jsonl

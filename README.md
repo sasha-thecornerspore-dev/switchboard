@@ -15,8 +15,10 @@ exactly the shares you choose.
 ## Features
 
 - **One-click folder sharing** over Tailscale Serve (tailnet-private) or Funnel (public internet)
-- **Three publish methods per share** — 🔗 Tailscale, 🔀 your own reverse proxy, or 🏠 local only
+- **Four publish methods per share** — 🔗 Tailscale, 🔀 your own reverse proxy, ☁ Cloudflare Tunnel, or 🏠 local only
   - **Reverse proxy** mode shows the exact origin your proxy must point at (localhost or LAN), a hostname field, and ready-to-paste **nginx**, **Apache**, and **OPNsense os-nginx** config with a Copy button. Password protection passes straight through.
+  - **OPNsense one-click push** — connect your firewall's API in ⚙ Settings and the OPNsense tab pushes the Upstream Server → Upstream → Location → HTTP Server objects and reconfigures nginx for you (idempotent; re-push updates in place; Remove cleans up)
+  - **Cloudflare Tunnel** mode — with no account, a throwaway `trycloudflare.com` quick link; with an API token, a stable hostname on **your own domain** through one managed tunnel (ingress + proxied CNAME handled for you). Offers to install `cloudflared` if it's missing.
   - **Local** mode serves on this machine or your LAN with nothing published
 - **Multi-user accounts & profiles**
   - Admin and User roles
@@ -37,6 +39,8 @@ Two small Node services, no external dependencies:
 |------|------|
 | `src/switchboard.js` | The manager: dashboard UI, auth, REST API, Tailscale orchestration. Listens on `http://127.0.0.1:18800`. |
 | `src/share-server.js` | A per-share static file server (directory listing, logging, optional Basic auth). One process per active share. |
+| `src/cloudflare.js` | Cloudflare Tunnel: `cloudflared` detection/install, quick tunnels, and the managed named tunnel (API: tunnel, ingress, DNS). |
+| `src/opnsense.js` | OPNsense os-nginx API client: idempotent push/remove of a share's reverse-proxy objects. |
 | `main.js` / `preload.js` | The Electron desktop wrapper — spawns the service, renders the dashboard, adds a tray icon and a native folder picker. |
 
 Each share gets its own local port. How that port reaches the world is the
@@ -46,9 +50,20 @@ share's **publish method**, switchable from its card:
 |--------|-----------------------|-------------|
 | 🔗 **Tailscale** (default) | Wires `tailscale serve` (tailnet) or `funnel` (public) to the port | `127.0.0.1` |
 | 🔀 **Reverse proxy** | Runs the share-server only; you point nginx / Apache / OPNsense at the origin shown on the card. Config for all three is generated for you. | `0.0.0.0` (LAN) by default, so a proxy on another box can reach it; flip to `127.0.0.1` if the proxy runs on the same PC |
+| ☁ **Cloudflare Tunnel** | Runs `cloudflared` for you. No token → a quick tunnel per share (random `https://*.trycloudflare.com`, changes on restart). Token configured → one managed named tunnel for the whole install; each share is an ingress rule `hostname → origin` plus a proxied CNAME on your zone. | `127.0.0.1` |
 | 🏠 **Local** | Runs the share-server only, nothing published | `127.0.0.1`, or `0.0.0.0` to let LAN devices in |
 
 The dashboard polls `/api/state` and renders everything client-side.
+
+### Integrations (⚙ Settings, admin only)
+
+| Integration | What you enter | What it enables |
+|-------------|----------------|-----------------|
+| **Cloudflare** | API token with *Account · Cloudflare Tunnel · Edit* and *Zone · DNS · Edit*, plus the zone (account ID is auto-filled) | Stable hostnames on your domain for Cloudflare shares. Switchboard creates tunnel `switchboard-<hostname>`, keeps its ingress in sync, and runs a single `cloudflared tunnel run --token` process. Removing a share or renaming its hostname removes the CNAME it created (never anyone else's). |
+| **OPNsense** | URL, API key + secret (System → Access → Users → API keys), allow self-signed cert | *Push to OPNsense* on a proxy share's OPNsense tab, with a TLS-certificate picker populated from the firewall. |
+
+Credentials live in `switchboard-settings.json` in the data folder (gitignored) and
+are only ever shown masked in the UI.
 
 ## Install
 
@@ -126,8 +141,9 @@ git tag v1.0.0 && git push origin v1.0.0
   endpoints requires a valid session.
 - **Don't expose the dashboard itself over public Funnel without a login** — it
   manages your file sharing. Tailnet-only access is recommended for the dashboard.
-- `switchboard-config.json`, `switchboard-users.json`, and
-  `FIRST-RUN-ADMIN-PASSWORD.txt` contain secrets and are **gitignored**.
+- `switchboard-config.json`, `switchboard-users.json`, `switchboard-settings.json`
+  (Cloudflare/OPNsense credentials), and `FIRST-RUN-ADMIN-PASSWORD.txt` contain
+  secrets and are **gitignored**.
 
 ## Platform support
 

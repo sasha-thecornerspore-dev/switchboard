@@ -8,6 +8,8 @@ const path = require("path");
 const crypto = require("crypto");
 const { spawn, exec, execFile } = require("child_process");
 const os = require("os");
+const { CloudflareTunnel, installCloudflared } = require("./cloudflare");
+const { OpnsenseClient } = require("./opnsense");
 
 const PORT = process.env.SWITCHBOARD_PORT ? parseInt(process.env.SWITCHBOARD_PORT, 10) : 18800;
 const HERE = __dirname;
@@ -19,6 +21,7 @@ const DATA_DIR = process.env.SWITCHBOARD_DATA_DIR || HERE;
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const CONFIG_PATH = path.join(DATA_DIR, "switchboard-config.json");
 const USERS_PATH = path.join(DATA_DIR, "switchboard-users.json");
+const SETTINGS_PATH = path.join(DATA_DIR, "switchboard-settings.json");
 const FIRSTRUN_PW_PATH = path.join(DATA_DIR, "FIRST-RUN-ADMIN-PASSWORD.txt");
 const SHARE_SERVER = path.join(HERE, "share-server.js");
 const LOG_DIR = path.join(DATA_DIR, "logs");
@@ -49,10 +52,14 @@ let state = {
 //   proxy     — Switchboard only runs the share-server; YOUR reverse proxy
 //               (nginx / Apache / OPNsense os-nginx) fronts it. The dashboard
 //               hands you ready-to-paste config for the origin it's listening on.
+//   cloudflare — a Cloudflare Tunnel fronts the share-server. With an API token
+//               configured in Settings it's a stable hostname on your zone via
+//               one managed named tunnel; without one it's a throwaway
+//               https://*.trycloudflare.com quick tunnel.
 //   local     — just the share-server on localhost/LAN, nothing published.
 // `bind` is the share-server listen address: 127.0.0.1 (same-machine proxy or
 // Tailscale) or 0.0.0.0 (LAN — required for a proxy on another box).
-const METHODS = ["tailscale", "proxy", "local"];
+const METHODS = ["tailscale", "proxy", "cloudflare", "local"];
 const BIND_LOCAL = "127.0.0.1";
 const BIND_LAN = "0.0.0.0";
 function normalizeShare(s) {
@@ -63,6 +70,30 @@ function normalizeShare(s) {
   return s;
 }
 function usesTailscale(s) { return s.method === "tailscale"; }
+function usesCloudflare(s) { return s.method === "cloudflare"; }
+
+// ============================== SETTINGS ==============================
+// Integration credentials (Cloudflare API token, OPNsense API key) live in
+// switchboard-settings.json — gitignored, admin-only, never sent to the UI in
+// full (see settingsForUi).
+let settings = { cloudflare: {}, opnsense: {} };
+function loadSettings() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf8"));
+    settings = { cloudflare: raw.cloudflare || {}, opnsense: raw.opnsense || {} };
+  } catch { settings = { cloudflare: {}, opnsense: {} }; }
+}
+function saveSettings() { fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2)); }
+function hint(secret) { return secret ? "…" + String(secret).slice(-4) : null; }
+function settingsForUi() {
+  const c = settings.cloudflare || {}, o = settings.opnsense || {};
+  return {
+    cloudflare: { accountId: c.accountId || "", zoneName: c.zoneName || "", zoneId: c.zoneId || null, apiTokenSet: !!c.apiToken, apiTokenHint: hint(c.apiToken), tunnelId: c.tunnelId || null, tunnelName: c.tunnelName || null },
+    opnsense: { url: o.url || "", key: o.key || "", secretSet: !!o.secret, secretHint: hint(o.secret), insecure: o.insecure !== false, certs: o.certs || [], version: o.version || null, lastTestAt: o.lastTestAt || null },
+  };
+}
+const cf = new CloudflareTunnel({ getSettings: () => settings.cloudflare, saveSettings, log: console.log });
+function opnsenseClient() { const o = settings.opnsense || {}; return new OpnsenseClient({ url: o.url, key: o.key, secret: o.secret, insecure: o.insecure !== false }); }
 
 // Interfaces that carry an IPv4 but are useless as a proxy origin: Hyper-V /
 // WSL virtual switches, VM host adapters, Docker bridges, Tailscale itself.
@@ -117,7 +148,7 @@ function loadConfig() {
   } catch { /* fresh start */ }
 }
 function saveConfig() {
-  const cfg = { shares: state.shares.map(s => ({ ...s, pid: undefined, lastError: undefined })) };
+  const cfg = { shares: state.shares.map(s => ({ ...s, pid: undefined, lastError: undefined, cfQuickUrl: undefined })) };
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
 }
 
@@ -342,6 +373,8 @@ async function reconcileShares() {
       // Tailscale shares can only come back once the tailnet is healthy; proxy
       // and local shares don't depend on it at all.
       if (usesTailscale(s) && state.backendState !== "Running") continue;
+      // Cloudflare shares need the binary; without it they'd just fail every tick.
+      if (usesCloudflare(s) && !cf.refreshBinary()) { s.lastError = "cloudflared is not installed"; continue; }
       try {
         await startShare(s);
         s.lastError = null;
@@ -382,11 +415,66 @@ async function removeTailscaleForShare(s) {
   await ts(`serve --https=${s.tailscalePort} ${pathArg} off`).catch(()=>{});
 }
 
+// ============================== CLOUDFLARE ==============================
+// Named mode (API configured + hostname on the zone) or quick mode (anything
+// else). Named: every cloudflare share becomes one ingress rule on the single
+// managed tunnel, plus a CNAME; one cloudflared process serves them all.
+function cloudflareModeFor(s) {
+  return cf.configured() && s.proxyHost && cf.hostnameInZone(s.proxyHost) ? "named" : "quick";
+}
+// `include` is the share being published right now — a brand-new share isn't
+// in state.shares until startShare succeeds, so it has to be added explicitly.
+function cloudflareIngressRules(exceptId, include) {
+  const list = state.shares.slice();
+  if (include && !list.some(x => x.id === include.id)) list.push(include);
+  return list
+    .filter(x => usesCloudflare(x) && !x.paused && x.id !== exceptId && x.proxyHost && cf.hostnameInZone(x.proxyHost))
+    .map(x => ({ hostname: x.proxyHost.toLowerCase(), service: `http://127.0.0.1:${x.localPort}` }));
+}
+async function applyCloudflareForShare(s) {
+  if (!usesCloudflare(s)) return;
+  if (!cf.refreshBinary()) throw Object.assign(new Error("cloudflared is not installed — use the Install button on the share card"), { needsInstall: true });
+  if (cf.configured() && s.proxyHost && !cf.hostnameInZone(s.proxyHost)) {
+    throw new Error(`Hostname ${s.proxyHost} isn't on your Cloudflare zone ${cf.zoneName()} — use a name under it, or clear it for a quick tunnel`);
+  }
+  if (cloudflareModeFor(s) === "named") {
+    cf.stopQuick(s.id); s.cfQuickUrl = null;
+    await cf.applyIngress(cloudflareIngressRules(null, s));
+    await cf.upsertDns(s.proxyHost.toLowerCase());
+    cf.ensureRunning();
+  } else {
+    const q = await cf.startQuick(s.id, s.localPort);
+    s.cfQuickUrl = q.url;
+  }
+}
+async function removeCloudflareForShare(s, { deleteDns = false } = {}) {
+  if (!usesCloudflare(s)) return;
+  cf.stopQuick(s.id); s.cfQuickUrl = null;
+  if (!cf.configured()) return;
+  const remaining = cloudflareIngressRules(s.id);
+  try {
+    if (settings.cloudflare.tunnelId) await cf.applyIngress(remaining);
+    if (deleteDns && s.proxyHost) await cf.deleteDns(s.proxyHost.toLowerCase());
+  } catch (e) { console.error("cloudflare teardown:", e.message); }
+  if (!remaining.length) cf.stopNamed();
+}
+
+// Method-agnostic publish/unpublish used by the share lifecycle.
+async function publishShare(s) {
+  if (usesTailscale(s)) return applyTailscaleForShare(s);
+  if (usesCloudflare(s)) return applyCloudflareForShare(s);
+}
+async function unpublishShare(s, opts) {
+  if (usesTailscale(s)) return removeTailscaleForShare(s);
+  if (usesCloudflare(s)) return removeCloudflareForShare(s, opts);
+}
+
 // ============================== SHARE LIFECYCLE ==============================
 // Badge + footer the share-server shows on its directory listing, so a share
 // never claims "tailnet-only" when it's actually on the LAN or behind a proxy.
 function shareLabels(s) {
   if (s.method === "proxy") return { badge: "VIA REVERSE PROXY", footer: `Hosted via Switchboard behind ${s.proxyHost || "your reverse proxy"}` };
+  if (s.method === "cloudflare") return { badge: "PUBLIC · CLOUDFLARE TUNNEL", footer: "Hosted via Switchboard through a Cloudflare Tunnel" };
   if (s.method === "local") return s.bind === BIND_LAN
     ? { badge: "LOCAL NETWORK", footer: "Hosted via Switchboard · Visible only on your local network" }
     : { badge: "THIS MACHINE ONLY", footer: "Hosted via Switchboard · Visible only on this machine" };
@@ -454,8 +542,14 @@ function sweepOrphanShareServers() {
     const ps = `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -like '*share-server.js*' } | ForEach-Object { $_.ProcessId }`;
     execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true, timeout: 8000 }, (err, stdout) => {
       if (!err && stdout) {
+        // Never sweep a share-server THIS instance already owns — a share
+        // created in the seconds between UI bind and this sweep used to get
+        // killed by its own cleanup.
+        const ours = new Set(state.shares.map(s => s.pid).filter(Boolean));
         for (const pid of stdout.trim().split(/\s+/).filter(Boolean)) {
-          try { process.kill(parseInt(pid, 10)); console.log(`Swept orphan share-server pid=${pid}`); } catch {}
+          const n = parseInt(pid, 10);
+          if (ours.has(n)) continue;
+          try { process.kill(n); console.log(`Swept orphan share-server pid=${pid}`); } catch {}
         }
       }
       resolve();
@@ -500,10 +594,10 @@ async function startShare(s) {
     throw new Error(`share-server for "${s.name}" did not come up on 127.0.0.1:${s.localPort} within 4s`);
   }
   try {
-    await applyTailscaleForShare(s);
+    await publishShare(s);
   } catch (e) {
-    // Tailscale publish failed — don't leave the share-server orphaned without
-    // a route. Caller treats this as "start failed".
+    // Publish failed — don't leave the share-server orphaned without a route.
+    // Caller treats this as "start failed".
     killShareServer(s);
     throw e;
   }
@@ -543,14 +637,14 @@ async function respawnShareServer(s) {
   if (!up) { killShareServer(s); throw new Error(`share-server for "${s.name}" did not come up on :${s.localPort}`); }
 }
 
-async function stopShare(s) {
+async function stopShare(s, opts) {
   killShareServer(s);
   // Best-effort wait for the child to release its port before tailscale teardown
   // and any subsequent restart. Without this, a quick stop+start (mode switch,
   // auth change, /restart) can EADDRINUSE because the SIGTERMed child hasn't
   // released 127.0.0.1:s.localPort yet.
   await waitForLocalPortFree(s.localPort, 2500);
-  await removeTailscaleForShare(s);
+  await unpublishShare(s, opts);
 }
 
 // ============================== STATS ==============================
@@ -609,14 +703,74 @@ async function handleApi(req, res, parsed, me) {
       stats: statsFor(s),
       urls: buildUrls(s),
       origin: originFor(s),
-      proxyConfigs: s.method === "proxy" ? proxyConfigsFor(s) : undefined
+      proxyConfigs: s.method === "proxy" ? proxyConfigsFor(s) : undefined,
+      cfMode: usesCloudflare(s) ? cloudflareModeFor(s) : undefined,
+      cfQuickUrl: usesCloudflare(s) ? (cf.quickUrl(s.id) || null) : undefined,
     }));
+    const ui = settingsForUi();
     return send(res, 200, {
       tailnetHost: state.tailnetHost, tailnetIPv4: state.tailnetIPv4, lanIPv4: state.lanIPv4,
       backendState: state.backendState, tailscaleInstalled: state.tailscaleInstalled !== false,
+      cloudflare: cf.status(),
+      opnsense: { configured: opnsenseClient().configured(), url: ui.opnsense.url, certs: ui.opnsense.certs },
       me: publicUser(me), isAdmin: isAdmin(me),
       shares: sharesOut
     });
+  }
+
+  // ---- settings (admin only): Cloudflare + OPNsense credentials ----
+  if (route === "settings" && req.method === "GET") {
+    if (!isAdmin(me)) return send(res, 403, { error: "admin only" });
+    return send(res, 200, { settings: settingsForUi(), cloudflare: cf.status() });
+  }
+  if (route === "settings" && req.method === "POST") {
+    if (!isAdmin(me)) return send(res, 403, { error: "admin only" });
+    const b = await readBody(req);
+    const c = settings.cloudflare, o = settings.opnsense;
+    if (b.cloudflare) {
+      const inp = b.cloudflare;
+      if (typeof inp.apiToken === "string" && inp.apiToken.trim()) { c.apiToken = inp.apiToken.trim(); }
+      if (inp.clearApiToken) { delete c.apiToken; delete c.tunnelToken; delete c.tunnelId; }
+      if (typeof inp.accountId === "string") c.accountId = inp.accountId.trim();
+      if (typeof inp.zoneName === "string") {
+        const z = inp.zoneName.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+        if (z !== (c.zoneName || "")) { c.zoneName = z; delete c.zoneId; }
+      }
+    }
+    if (b.opnsense) {
+      const inp = b.opnsense;
+      if (typeof inp.url === "string") o.url = inp.url.trim();
+      if (typeof inp.key === "string") o.key = inp.key.trim();
+      if (typeof inp.secret === "string" && inp.secret.trim()) o.secret = inp.secret.trim();
+      if (inp.clearSecret) delete o.secret;
+      if (typeof inp.insecure === "boolean") o.insecure = inp.insecure;
+    }
+    saveSettings();
+    return send(res, 200, { ok: true, settings: settingsForUi(), cloudflare: cf.status() });
+  }
+  if (route === "cloudflare/test" && req.method === "POST") {
+    if (!isAdmin(me)) return send(res, 403, { error: "admin only" });
+    try { return send(res, 200, { ok: true, result: await cf.verify(), settings: settingsForUi() }); }
+    catch (e) { return send(res, 500, { error: e.message }); }
+  }
+  if (route === "cloudflare/install" && req.method === "POST") {
+    if (!isAdmin(me)) return send(res, 403, { error: "admin only" });
+    if (cf.refreshBinary()) return send(res, 200, { ok: true, alreadyInstalled: true, cloudflare: cf.status() });
+    try {
+      const out = await installCloudflared();
+      cf.refreshBinary();
+      reconcileShares();
+      return send(res, 200, { ok: true, output: out, cloudflare: cf.status() });
+    } catch (e) { return send(res, 500, { error: e.message, manualUrl: e.manualUrl }); }
+  }
+  if (route === "opnsense/test" && req.method === "POST") {
+    if (!isAdmin(me)) return send(res, 403, { error: "admin only" });
+    try {
+      const r = await opnsenseClient().test();
+      settings.opnsense.certs = r.certs; settings.opnsense.version = r.version; settings.opnsense.lastTestAt = new Date().toISOString();
+      saveSettings();
+      return send(res, 200, { ok: true, certs: r.certs, version: r.version });
+    } catch (e) { return send(res, 500, { error: e.message }); }
   }
 
   // ---- user management (admin only) ----
@@ -705,6 +859,7 @@ async function handleApi(req, res, parsed, me) {
     });
     // A share published through a proxy on another box must listen on the LAN.
     if (s.method === "proxy" && body.bind === undefined) s.bind = BIND_LAN;
+    if (s.proxyHost) s.proxyHost = s.proxyHost.trim().replace(/^https?:\/\//i, "").replace(/[\/:].*$/, "").toLowerCase();
     try {
       await startShare(s);
       state.shares.push(s); saveConfig();
@@ -722,10 +877,37 @@ async function handleApi(req, res, parsed, me) {
     if (!canViewShare(me, id)) return send(res, 404, { error: "share not found" });
     if (!canManageShare(me, id)) return send(res, 403, { error: "you have view-only access to this share" });
 
-    if (req.method === "DELETE") {
-      await stopShare(s);
+    // Bare DELETE /api/shares/:id removes the share. The `!sub` guard matters:
+    // without it, DELETE …/auth and DELETE …/opnsense deleted the whole share.
+    if (req.method === "DELETE" && !sub) {
+      await stopShare(s, { deleteDns: true });
       state.shares = state.shares.filter(x => x.id !== id); saveConfig();
       return send(res, 200, { ok: true });
+    }
+
+    // ---- OPNsense: push / remove this share's reverse-proxy objects ----
+    if (sub === "opnsense" && req.method === "POST") {
+      if (!isAdmin(me)) return send(res, 403, { error: "admin only" });
+      const b = await readBody(req);
+      if (typeof b.certificate === "string") s.opnsenseCert = b.certificate;
+      const client = opnsenseClient();
+      if (!client.configured()) return send(res, 400, { error: "OPNsense isn't configured — open ⚙ Settings first" });
+      const originHost = s.bind === BIND_LAN ? state.lanIPv4 : "127.0.0.1";
+      try {
+        const r = await client.pushShare({ name: s.name, originHost, originPort: s.localPort, hostname: s.proxyHost, certificate: s.opnsenseCert || "" });
+        s.opnsense = { uuids: r.uuids, tag: r.tag, pushedAt: r.pushedAt, hostname: s.proxyHost, origin: `${originHost}:${s.localPort}` };
+        saveConfig();
+        return send(res, 200, { ok: true, opnsense: s.opnsense, steps: r.steps });
+      } catch (e) { return send(res, 500, { error: e.message }); }
+    }
+    if (sub === "opnsense" && req.method === "DELETE") {
+      if (!isAdmin(me)) return send(res, 403, { error: "admin only" });
+      if (!s.opnsense) return send(res, 200, { ok: true, removed: {} });
+      try {
+        const removed = await opnsenseClient().removeShare(s.opnsense.uuids);
+        s.opnsense = null; saveConfig();
+        return send(res, 200, { ok: true, removed });
+      } catch (e) { return send(res, 500, { error: e.message }); }
     }
 
     // Publish method: tailscale | proxy | local, plus the share-server bind
@@ -743,15 +925,28 @@ async function handleApi(req, res, parsed, me) {
       if (b.proxyHost !== undefined) {
         next.proxyHost = String(b.proxyHost).trim().replace(/^https?:\/\//i, "").replace(/[\/:].*$/, "").toLowerCase();
       }
+      // OPNsense certificate choice rides along (no publish side effects).
+      if (typeof b.opnsenseCert === "string") s.opnsenseCert = b.opnsenseCert;
       // Switching TO proxy without an explicit bind: a proxy on another box
       // (OPNsense) can only reach a LAN-bound origin, so enable LAN.
       if (next.method === "proxy" && prev.method !== "proxy" && b.bind === undefined) next.bind = BIND_LAN;
 
       const methodChanged = next.method !== prev.method;
       const bindChanged = next.bind !== prev.bind;
+      const hostChanged = next.proxyHost !== prev.proxyHost;
       if (!methodChanged && !bindChanged) {
+        if (hostChanged && usesCloudflare(s) && !s.paused) {
+          // Hostname is the Cloudflare ingress/DNS key — tear down the old
+          // route (dropping our CNAME) and publish under the new name.
+          try { await removeCloudflareForShare(s, { deleteDns: true }); } catch (e) { console.error("cloudflare rename teardown:", e.message); }
+          s.proxyHost = next.proxyHost;
+          try { await applyCloudflareForShare(s); }
+          catch (e) { s.proxyHost = prev.proxyHost; try { await applyCloudflareForShare(s); } catch {} return send(res, 500, { error: e.message }); }
+          s.lastError = null; saveConfig();
+          return send(res, 200, { ok: true, share: s });
+        }
         s.proxyHost = next.proxyHost;
-        if (!s.paused && s.pid && s.method !== "tailscale") {
+        if (hostChanged && !s.paused && s.pid && s.method === "proxy") {
           // Footer text names the proxy host — refresh it, best-effort.
           try { await respawnShareServer(s); } catch (e) { s.lastError = e.message; }
         }
@@ -759,15 +954,15 @@ async function handleApi(req, res, parsed, me) {
         return send(res, 200, { ok: true, share: s });
       }
 
-      // Leaving Tailscale: drop the serve/funnel route first (uses OLD fields).
-      if (methodChanged && prev.method === "tailscale") await removeTailscaleForShare(s);
+      // Leaving a published method: drop its route first (uses OLD fields).
+      if (methodChanged) { try { await unpublishShare(s, { deleteDns: true }); } catch (e) { console.error("unpublish on method change:", e.message); } }
       Object.assign(s, next);
       const rollback = async (err) => {
         Object.assign(s, { method: prev.method, bind: prev.bind, proxyHost: prev.proxyHost, tailscalePort: prev.tailscalePort, pathToken: prev.pathToken });
         if (!s.paused) {
-          try { await respawnShareServer(s); await applyTailscaleForShare(s); } catch (e2) { s.lastError = e2.message; }
+          try { await respawnShareServer(s); await publishShare(s); } catch (e2) { s.lastError = e2.message; }
         }
-        return send(res, 500, { error: err.message });
+        return send(res, 500, { error: err.message, needsInstall: !!err.needsInstall });
       };
       if (!s.paused) {
         if (bindChanged || !s.pid) {
@@ -776,7 +971,9 @@ async function handleApi(req, res, parsed, me) {
         if (methodChanged && s.method === "tailscale") {
           if (s.mode === "public" && s.auth && !s.pathToken) s.pathToken = genToken(10);
           s.tailscalePort = nextTailscalePort(s.mode, !!s.pathToken);
-          try { await applyTailscaleForShare(s); } catch (e) { return rollback(e); }
+        }
+        if (methodChanged) {
+          try { await publishShare(s); } catch (e) { return rollback(e); }
         }
       }
       s.lastError = null;
@@ -919,6 +1116,17 @@ function buildUrls(s) {
     if (s.proxyHost) urls.push({ label: "Public (via proxy)", url: `https://${s.proxyHost}/`, primary: true });
     urls.push({ label: "Origin", url: originFor(s) + "/", primary: !s.proxyHost,
       note: s.bind === BIND_LAN ? "Point your reverse proxy here" : "Same-machine proxy only — flip to LAN for OPNsense" });
+    return urls;
+  }
+  if (s.method === "cloudflare") {
+    if (cloudflareModeFor(s) === "named") {
+      urls.push({ label: "Public (Cloudflare)", url: `https://${s.proxyHost.toLowerCase()}/`, primary: true });
+    } else {
+      const q = cf.quickUrl(s.id);
+      urls.push({ label: "Public (quick tunnel)", url: q ? q + "/" : "https://…starting….trycloudflare.com/", primary: true,
+        note: q ? "Random trycloudflare.com URL — changes every restart" : "Waiting for cloudflared to hand back a URL" });
+    }
+    urls.push({ label: "Origin", url: `http://127.0.0.1:${s.localPort}/`, note: "What the tunnel forwards to" });
     return urls;
   }
   if (s.method === "local") {
@@ -1220,8 +1428,32 @@ h2.section{font-size:14px;letter-spacing:.12em;text-transform:uppercase;color:rg
 .toggle-mode button.active.proxy{background:#6c8cc8;color:#fff;}
 .toggle-mode button.active.local{background:var(--green);color:#fff;}
 .toggle-mode button:disabled{opacity:.45;cursor:default;}
+.toggle-mode button.active.cf{background:#F6821F;color:#fff;}
 .badge-proxy{background:rgba(108,140,200,.22);color:#bcd0f5;}
 .badge-local{background:rgba(43,174,102,.15);color:#7be3a4;}
+.badge-cf{background:rgba(246,130,31,.2);color:#ffb37a;}
+.pub-panel.cf{background:rgba(246,130,31,.08);border-color:rgba(246,130,31,.4);}
+.pub-panel.cf .pub-head{color:#ffb37a;}
+.pub-status{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:rgba(255,255,255,.7);}
+.pub-status .dot{width:8px;height:8px;border-radius:50%;background:var(--gray-2);}
+.pub-status .dot.on{background:var(--green);}
+.pub-status .dot.warn{background:var(--amber);animation:blink 1.2s ease-in-out infinite;}
+.pub-status .dot.off{background:var(--red);}
+.pub-row select{background:rgba(0,0,0,.3);border:1px solid var(--line);color:white;padding:5px 8px;border-radius:6px;font-size:12px;font-family:inherit;min-width:160px;flex:1;}
+.pub-row select option{background:var(--navy-2);}
+.opn-push{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px solid var(--line);font-size:11px;}
+.opn-push .ok{color:#7be3a4;}
+.modal .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.modal .hintline{font-size:11px;color:rgba(255,255,255,.5);margin-top:6px;line-height:1.45;}
+.modal .hintline a{color:var(--amber);}
+.modal h4.sec{font-size:13px;letter-spacing:.1em;text-transform:uppercase;color:var(--amber);margin:22px 0 2px;display:flex;justify-content:space-between;align-items:center;}
+.modal h4.sec:first-of-type{margin-top:8px;}
+.modal .check{display:flex;align-items:center;gap:8px;font-size:13px;margin-top:12px;color:rgba(255,255,255,.8);}
+.modal .check input{width:16px;height:16px;}
+.testbox{margin-top:10px;font-size:12px;border-radius:10px;padding:9px 12px;display:none;line-height:1.45;}
+.testbox.show{display:block;}
+.testbox.ok{background:rgba(43,174,102,.1);border:1px solid rgba(43,174,102,.4);color:#c8f3d8;}
+.testbox.bad{background:rgba(225,79,79,.12);border:1px solid rgba(225,79,79,.4);color:#ffb3b3;}
 
 /* Publish-method config panel (proxy / local) */
 .pub-panel{background:rgba(108,140,200,.08);border:1px solid rgba(108,140,200,.35);border-radius:12px;padding:12px;margin-bottom:14px;}
@@ -1330,6 +1562,7 @@ h2.section{font-size:14px;letter-spacing:.12em;text-transform:uppercase;color:rg
     </div>
     <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
       <div class="tn" id="tn" title="Click to copy tailnet host · right-click for more" onclick="copyTailnet()" oncontextmenu="tnMenu(event); return false;">tailnet: <span id="tn-info">…</span><span class="hint">click to copy</span></div>
+      <button class="btn btn-ghost" id="settings-btn" onclick="openSettings()" style="display:none;" title="Cloudflare &amp; OPNsense integrations">⚙ Settings</button>
       <button class="btn btn-ghost" id="users-btn" onclick="openUsersModal()" style="display:none;">👥 Users</button>
       <button class="btn btn-primary" id="newshare-btn" onclick="openModal()">+ New share</button>
       <div class="userchip" id="userchip" title="Signed in"><span id="uc-name">…</span><span id="uc-role" class="uc-role"></span><button class="uc-logout" onclick="logout()" title="Sign out">⎋</button></div>
@@ -1419,6 +1652,49 @@ h2.section{font-size:14px;letter-spacing:.12em;text-transform:uppercase;color:rg
     <p class="sub">Give people their own login. Admins control everything; users see only the shares you grant them — view-only or manage.</p>
     <div id="users-list"></div>
     <div class="modal-actions"><button class="btn btn-ghost" onclick="closeUsersModal()">Close</button></div>
+  </div>
+</div>
+
+<!-- Settings modal: Cloudflare + OPNsense -->
+<div class="modal-overlay" id="settings-modal" onclick="if(event.target===this)closeSettings()">
+  <div class="modal wide">
+    <h3>⚙ Integrations</h3>
+    <p class="sub">Credentials stay in <code>switchboard-settings.json</code> next to your other data and are never shown in full again.</p>
+
+    <h4 class="sec"><span>☁ Cloudflare Tunnel</span><span id="cf-bin" style="font-size:11px;font-weight:500;letter-spacing:0;text-transform:none;color:rgba(255,255,255,.6);"></span></h4>
+    <div class="hintline">Without credentials, Cloudflare shares get a random <b>trycloudflare.com</b> quick-tunnel URL. Add an API token to publish on <b>your own domain</b>: Switchboard creates one managed tunnel, writes an ingress rule per share and a proxied CNAME per hostname. Token permissions: <b>Account · Cloudflare Tunnel · Edit</b> and <b>Zone · DNS · Edit</b> on the zone.</div>
+    <label>API token</label>
+    <input id="st-cf-token" type="text" autocomplete="off" placeholder="paste a token (leave blank to keep the current one)">
+    <div class="row2">
+      <div><label>Zone (domain)</label><input id="st-cf-zone" type="text" placeholder="example.com"></div>
+      <div><label>Account ID <span style="opacity:.5;text-transform:none;letter-spacing:0;">(auto-filled from the zone if blank)</span></label><input id="st-cf-account" type="text" placeholder="32-char account id"></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap;">
+      <button class="btn btn-ghost btn-tiny" onclick="testCloudflare()" id="st-cf-test">Save &amp; test</button>
+      <button class="btn btn-danger btn-tiny" onclick="clearCloudflare()" id="st-cf-clear" style="display:none;">Forget token</button>
+      <span id="st-cf-state" style="font-size:12px;color:rgba(255,255,255,.6);"></span>
+    </div>
+    <div class="testbox" id="st-cf-result"></div>
+
+    <h4 class="sec"><span>🛡 OPNsense (os-nginx)</span></h4>
+    <div class="hintline">Lets a proxy share's OPNsense tab <b>push</b> the Upstream Server → Upstream → Location → HTTP Server objects straight into the firewall and reconfigure nginx. Create a key under <b>System → Access → Users → API keys</b> for a user with nginx privileges.</div>
+    <label>OPNsense URL</label>
+    <input id="st-op-url" type="text" placeholder="https://192.168.1.1  (or https://fw.lan:8443)">
+    <div class="row2">
+      <div><label>API key</label><input id="st-op-key" type="text" autocomplete="off" placeholder="key"></div>
+      <div><label>API secret</label><input id="st-op-secret" type="text" autocomplete="off" placeholder="leave blank to keep current"></div>
+    </div>
+    <label class="check"><input type="checkbox" id="st-op-insecure" checked> Allow self-signed certificate on the OPNsense host</label>
+    <div style="display:flex;gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap;">
+      <button class="btn btn-ghost btn-tiny" onclick="testOpnsense()" id="st-op-test">Save &amp; test</button>
+      <span id="st-op-state" style="font-size:12px;color:rgba(255,255,255,.6);"></span>
+    </div>
+    <div class="testbox" id="st-op-result"></div>
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeSettings()">Close</button>
+      <button class="btn btn-primary" onclick="saveSettings(true)">Save</button>
+    </div>
   </div>
 </div>
 
@@ -1613,7 +1889,138 @@ const PROXY_TAB = {};   // shareId -> 'nginx' | 'apache' | 'opnsense' (survives 
 function esc(s) {
   return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
-const METHOD_LABEL = { tailscale: 'Tailscale', proxy: 'Reverse proxy', local: 'Local only' };
+const METHOD_LABEL = { tailscale: 'Tailscale', proxy: 'Reverse proxy', cloudflare: 'Cloudflare Tunnel', local: 'Local only' };
+
+// ——— OPNsense push (proxy shares, OPNsense tab) ———————————————————————
+function opnsensePushHtml(s, canManage) {
+  const op = (LAST_DATA && LAST_DATA.opnsense) || {};
+  if (!ME_IS_ADMIN) return '';
+  if (!op.configured) {
+    return '<div class="opn-push"><span style="color:rgba(255,255,255,.6);">Tired of pasting? </span><a href="#" onclick="openSettings();return false;" style="color:var(--amber);">Connect OPNsense in ⚙ Settings</a><span style="color:rgba(255,255,255,.6);"> and push these four objects with one click.</span></div>';
+  }
+  const certs = op.certs || [];
+  const chosen = s.opnsenseCert || '';
+  const sel = '<select id="oc-' + s.id + '" onchange="setOpnCert(\\''+s.id+'\\', this.value)">' +
+    '<option value=""' + (chosen===''?' selected':'') + '>' + (certs.length ? '— pick a TLS certificate —' : 'no certificates listed (run Save & test in Settings)') + '</option>' +
+    certs.map(function(c){ return '<option value="' + esc(c.id) + '"' + (c.id===chosen?' selected':'') + '>' + esc(c.name) + '</option>'; }).join('') +
+    '</select>';
+  const pushed = s.opnsense;
+  return '<div class="opn-push">' +
+      '<span class="pub-lbl" style="width:auto;">Cert</span>' + sel +
+      '<button class="btn btn-primary btn-tiny" onclick="pushOpnsense(\\''+s.id+'\\', this)">' + (pushed ? '⚡ Re-push' : '⚡ Push to OPNsense') + '</button>' +
+      (pushed ? '<button class="btn btn-ghost btn-tiny" onclick="removeOpnsense(\\''+s.id+'\\', this)">Remove</button>' : '') +
+    '</div>' +
+    (pushed ? '<div class="pub-note"><span class="ok">✓ Pushed ' + fmtTime(pushed.pushedAt) + '</span> as <b>' + esc(pushed.tag) + '</b> → ' + esc(pushed.hostname||'') + ' ⇢ ' + esc(pushed.origin||'') +
+      ((pushed.hostname !== s.proxyHost || pushed.origin !== (s.origin||'').replace(/^https?:\\/\\//,'')) ? ' <span style="color:var(--amber);">(share changed since — re-push)</span>' : '') + '</div>' : '') +
+    (op.url ? '<div class="pub-note">Target: <b>' + esc(op.url) + '</b></div>' : '');
+}
+async function setOpnCert(id, v) {
+  const s = (LAST_DATA && LAST_DATA.shares || []).find(function(x){ return x.id === id; });
+  if (s) s.opnsenseCert = v;
+  await api('POST', '/api/shares/' + id + '/publish', { opnsenseCert: v });   // persist so a re-render keeps it
+}
+async function pushOpnsense(id, btn) {
+  const s = (LAST_DATA && LAST_DATA.shares || []).find(function(x){ return x.id === id; });
+  if (!s) return;
+  if (!s.proxyHost) { toast('Set the public hostname first'); return; }
+  const sel = document.getElementById('oc-' + id);
+  const cert = sel ? sel.value : (s.opnsenseCert || '');
+  if (!cert && !confirm('No TLS certificate selected — OPNsense will use its default for this HTTP server. Push anyway?')) return;
+  const old = btn.textContent; btn.disabled = true; btn.textContent = 'Pushing…';
+  const r = await api('POST', '/api/shares/' + id + '/opnsense', { certificate: cert });
+  btn.disabled = false; btn.textContent = old;
+  if (r.error) { toast('OPNsense: ' + r.error); return; }
+  toast('Pushed to OPNsense: ' + (r.steps || []).join(' → '));
+  bamfloozle(60); refresh();
+}
+async function removeOpnsense(id, btn) {
+  if (!confirm('Remove this share\\'s nginx objects from OPNsense and reconfigure?')) return;
+  btn.disabled = true;
+  const r = await api('DELETE', '/api/shares/' + id + '/opnsense');
+  btn.disabled = false;
+  if (r.error) { toast('OPNsense: ' + r.error); return; }
+  toast('Removed from OPNsense'); refresh();
+}
+
+// ——— Cloudflare helpers ————————————————————————————————————————————————
+async function installCloudflared(btn) {
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Installing…'; }
+  toast('Installing cloudflared — this can take a minute and may ask for admin permission.');
+  const r = await api('POST', '/api/cloudflare/install');
+  if (btn) { btn.disabled = false; btn.textContent = old; }
+  if (r.error) { toast('Install failed: ' + r.error); if (r.manualUrl) window.open(r.manualUrl, '_blank'); return; }
+  toast(r.alreadyInstalled ? 'cloudflared is already installed' : 'cloudflared installed'); bamfloozle(50); refresh();
+}
+
+// ——— Settings modal ———————————————————————————————————————————————————
+let SETTINGS = null;
+function openSettings() { loadSettingsUi(); document.getElementById('settings-modal').classList.add('open'); }
+function closeSettings() { document.getElementById('settings-modal').classList.remove('open'); }
+function showTest(id, ok, html) { const b = document.getElementById(id); b.className = 'testbox show ' + (ok ? 'ok' : 'bad'); b.innerHTML = html; }
+function hideTest(id) { document.getElementById(id).className = 'testbox'; }
+async function loadSettingsUi() {
+  const r = await api('GET', '/api/settings');
+  if (r.error) { toast(r.error); return; }
+  SETTINGS = r.settings;
+  const c = r.settings.cloudflare, o = r.settings.opnsense, cfs = r.cloudflare || {};
+  document.getElementById('st-cf-token').value = '';
+  document.getElementById('st-cf-token').placeholder = c.apiTokenSet ? 'token saved (' + c.apiTokenHint + ') — paste to replace' : 'paste a Cloudflare API token';
+  document.getElementById('st-cf-zone').value = c.zoneName || '';
+  document.getElementById('st-cf-account').value = c.accountId || '';
+  document.getElementById('st-cf-clear').style.display = c.apiTokenSet ? '' : 'none';
+  document.getElementById('st-cf-state').textContent = c.tunnelName ? 'tunnel: ' + c.tunnelName + (cfs.tunnel && cfs.tunnel.connected ? ' · connected' : '') : (c.apiTokenSet ? 'token saved — no tunnel yet (created on first Cloudflare share)' : 'not configured → quick tunnels only');
+  document.getElementById('cf-bin').textContent = cfs.installed ? 'cloudflared: ' + (cfs.bin || 'found') : 'cloudflared not installed';
+  document.getElementById('st-op-url').value = o.url || '';
+  document.getElementById('st-op-key').value = o.key || '';
+  document.getElementById('st-op-secret').value = '';
+  document.getElementById('st-op-secret').placeholder = o.secretSet ? 'secret saved (' + o.secretHint + ') — paste to replace' : 'secret';
+  document.getElementById('st-op-insecure').checked = o.insecure !== false;
+  document.getElementById('st-op-state').textContent = o.lastTestAt ? 'last test ' + fmtTime(o.lastTestAt) + (o.version ? ' · OPNsense ' + o.version : '') + ' · ' + (o.certs||[]).length + ' cert(s)' : (o.url ? 'not tested yet' : 'not configured');
+  hideTest('st-cf-result'); hideTest('st-op-result');
+}
+function gatherSettings() {
+  return {
+    cloudflare: { apiToken: document.getElementById('st-cf-token').value, zoneName: document.getElementById('st-cf-zone').value, accountId: document.getElementById('st-cf-account').value },
+    opnsense: { url: document.getElementById('st-op-url').value, key: document.getElementById('st-op-key').value, secret: document.getElementById('st-op-secret').value, insecure: document.getElementById('st-op-insecure').checked },
+  };
+}
+async function saveSettings(close) {
+  const r = await api('POST', '/api/settings', gatherSettings());
+  if (r.error) { toast('Error: ' + r.error); return false; }
+  toast('Settings saved');
+  if (close) { closeSettings(); refresh(); } else { await loadSettingsUi(); }
+  return true;
+}
+async function testCloudflare() {
+  const btn = document.getElementById('st-cf-test'); btn.disabled = true; btn.textContent = 'Testing…';
+  const saved = await api('POST', '/api/settings', gatherSettings());
+  if (saved.error) { btn.disabled = false; btn.textContent = 'Save & test'; toast(saved.error); return; }
+  const r = await api('POST', '/api/cloudflare/test');
+  btn.disabled = false; btn.textContent = 'Save & test';
+  if (r.error) { showTest('st-cf-result', false, '✗ ' + esc(r.error)); return; }
+  const v = r.result || {};
+  showTest('st-cf-result', true, '✓ Token valid' + (v.zoneName ? ' · zone <b>' + esc(v.zoneName) + '</b> found' : '') + (v.accountId ? ' · account ' + esc(v.accountId) : '') +
+    (v.tunnel ? '<br>Tunnel <b>' + esc(v.tunnel.name) + '</b> exists (' + esc(v.tunnel.status||'') + ')' : '<br>No tunnel yet — it\\'s created the first time a share is published via Cloudflare.') +
+    (v.cloudflared ? '' : '<br><span style="color:var(--amber);">cloudflared isn\\'t installed on this machine — install it from a Cloudflare share card.</span>'));
+  await loadSettingsUi(); refresh();
+}
+async function clearCloudflare() {
+  if (!confirm('Forget the Cloudflare API token? Existing Cloudflare shares fall back to quick tunnels on their next restart.')) return;
+  const r = await api('POST', '/api/settings', { cloudflare: { clearApiToken: true } });
+  if (r.error) { toast(r.error); return; }
+  toast('Cloudflare token removed'); await loadSettingsUi(); refresh();
+}
+async function testOpnsense() {
+  const btn = document.getElementById('st-op-test'); btn.disabled = true; btn.textContent = 'Testing…';
+  const saved = await api('POST', '/api/settings', gatherSettings());
+  if (saved.error) { btn.disabled = false; btn.textContent = 'Save & test'; toast(saved.error); return; }
+  const r = await api('POST', '/api/opnsense/test');
+  btn.disabled = false; btn.textContent = 'Save & test';
+  if (r.error) { showTest('st-op-result', false, '✗ ' + esc(r.error)); return; }
+  showTest('st-op-result', true, '✓ Connected' + (r.version ? ' · OPNsense ' + esc(r.version) : '') + ' · os-nginx present · ' + (r.certs||[]).length + ' certificate(s): ' + esc((r.certs||[]).map(function(c){return c.name;}).join(', ') || 'none'));
+  await loadSettingsUi(); refresh();
+}
 async function setMethod(id, method) {
   const s = (LAST_DATA && LAST_DATA.shares || []).find(function(x){ return x.id === id; });
   if (s && (s.method || 'tailscale') === method) return;
@@ -1747,6 +2154,7 @@ function shareCard(s) {
   let badgeText, badgeClass;
   if (s.paused) { badgeText = '⏸ PAUSED'; badgeClass = 'badge-paused'; }
   else if (method === 'proxy') { badgeText = '🔀 ' + lock + 'PROXY'; badgeClass = 'badge-proxy'; }
+  else if (method === 'cloudflare') { badgeText = '☁ ' + lock + (s.cfMode === 'named' ? 'CLOUDFLARE' : 'QUICK TUNNEL'); badgeClass = 'badge-cf'; }
   else if (method === 'local') { badgeText = '🏠 ' + lock + (s.bind === '0.0.0.0' ? 'LAN' : 'LOCAL'); badgeClass = 'badge-local'; }
   else if (s.mode === 'public') { badgeText = s.auth ? '🌐🔐 PUBLIC + AUTH' : '🌐 PUBLIC'; badgeClass = s.auth ? 'badge-mix' : 'badge-pub'; }
   else { badgeText = '🔒 TAILNET'; badgeClass = 'badge-priv'; }
@@ -1782,6 +2190,40 @@ function shareCard(s) {
         '<span class="sp"></span><button class="copy" onclick="copyCfg(\\''+s.id+'\\', this)">Copy ' + (tab==='opnsense'?'steps':'config') + '</button>' +
       '</div>' +
       '<pre class="cfg">' + esc(cfgs[tab] || '') + '</pre>' +
+      (tab === 'opnsense' ? opnsensePushHtml(s, canManage) : '') +
+    '</div>';
+  } else if (method === 'cloudflare') {
+    const cfg = (LAST_DATA && LAST_DATA.cloudflare) || {};
+    const named = s.cfMode === 'named';
+    let status;
+    if (!cfg.installed) status = '<span class="pub-status"><span class="dot off"></span>cloudflared not installed</span>' +
+      (ME_IS_ADMIN ? ' <button class="btn btn-primary btn-tiny" onclick="installCloudflared(this)">⬇ Install cloudflared</button>' : '');
+    else if (s.paused) status = '<span class="pub-status"><span class="dot"></span>paused</span>';
+    else if (named) {
+      const t = cfg.tunnel || {};
+      status = '<span class="pub-status"><span class="dot ' + (t.connected ? 'on' : (t.running ? 'warn' : 'off')) + '"></span>' +
+        (t.connected ? 'tunnel connected' : (t.running ? 'tunnel connecting…' : 'tunnel not running')) +
+        (t.name ? ' · ' + esc(t.name) : '') + '</span>' +
+        (t.lastError && !t.connected ? '<div class="pub-note" style="color:#ffb3b3;">' + esc(t.lastError) + '</div>' : '');
+    } else {
+      status = '<span class="pub-status"><span class="dot ' + (s.cfQuickUrl ? 'on' : (s.running ? 'warn' : 'off')) + '"></span>' +
+        (s.cfQuickUrl ? 'quick tunnel live' : (s.running ? 'waiting for URL…' : 'not running')) + '</span>';
+    }
+    pubHtml = '<div class="pub-panel cf">' +
+      '<div class="pub-head"><span>☁ Cloudflare Tunnel</span>' + status + '</div>' +
+      (cfg.configured
+        ? '<div class="pub-row"><span class="pub-lbl">Hostname</span>' +
+            (canManage
+              ? '<input id="ph-' + s.id + '" value="' + esc(s.proxyHost||'') + '" placeholder="files.' + esc(cfg.zoneName||'example.com') + '" onkeydown="if(event.key===\\'Enter\\'){this.blur();}" onblur="saveProxyHost(\\''+s.id+'\\', this)">'
+              : '<code>' + esc(s.proxyHost || '—') + '</code>') +
+          '</div>' +
+          (named
+            ? '<div class="pub-note">Served through the managed tunnel <b>' + esc((cfg.tunnel||{}).name || '') + '</b> with a proxied CNAME on <b>' + esc(cfg.zoneName||'') + '</b>. Clear the hostname to fall back to a quick tunnel.</div>'
+            : '<div class="pub-note">' + (s.proxyHost
+                ? '<b>' + esc(s.proxyHost) + '</b> isn\\'t under your zone <b>' + esc(cfg.zoneName||'') + '</b>, so this share is on a random quick-tunnel URL. Use a name ending in .' + esc(cfg.zoneName||'') + '.'
+                : 'No hostname → random <b>trycloudflare.com</b> URL that changes on restart. Enter a name under <b>' + esc(cfg.zoneName||'') + '</b> for a stable address.') + '</div>')
+        : '<div class="pub-note">Random <b>trycloudflare.com</b> URL, no account needed — it changes every time the share restarts. ' +
+            (ME_IS_ADMIN ? 'Add a Cloudflare API token in <a href="#" onclick="openSettings();return false;" style="color:var(--amber);">⚙ Settings</a> to publish on your own domain.' : 'Ask an admin to add a Cloudflare API token for a stable hostname.') + '</div>') +
     '</div>';
   } else if (method === 'local') {
     pubHtml = '<div class="pub-panel local">' +
@@ -1818,6 +2260,7 @@ function shareCard(s) {
           ? '<div class="toggle-mode" title="Publish method">' +
               '<button class="' + (method==='tailscale'?'active':'') + '" onclick="setMethod(\\''+s.id+'\\', \\'tailscale\\')" title="tailscale serve / funnel">🔗 Tailscale</button>' +
               '<button class="' + (method==='proxy'?'active proxy':'') + '" onclick="setMethod(\\''+s.id+'\\', \\'proxy\\')" title="Your own reverse proxy (nginx / Apache / OPNsense)">🔀 Proxy</button>' +
+              '<button class="' + (method==='cloudflare'?'active cf':'') + '" onclick="setMethod(\\''+s.id+'\\', \\'cloudflare\\')" title="Cloudflare Tunnel (quick trycloudflare.com link, or your own domain with an API token)">☁ Cloudflare</button>' +
               '<button class="' + (method==='local'?'active local':'') + '" onclick="setMethod(\\''+s.id+'\\', \\'local\\')" title="localhost / LAN only, nothing published">🏠 Local</button>' +
             '</div>' +
             (method === 'tailscale'
@@ -2023,7 +2466,7 @@ function renderShares(data) {
   // arriving mid-keystroke would otherwise re-render and eat their input.
   const box = document.getElementById('shares');
   const ae = document.activeElement;
-  if (ae && ae.tagName === 'INPUT' && box.contains(ae)) return;
+  if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'SELECT') && box.contains(ae)) return;
   setHtmlIfChanged('shares', data.shares.length
     ? data.shares.map(shareCard).join('')
     : '<div class="empty" style="grid-column:1/-1;">No shares yet. Click "+ New share" to add one.</div>');
@@ -2042,6 +2485,7 @@ async function refresh() {
     const rl = document.getElementById('uc-role');
     rl.textContent = data.me.role; rl.className = 'uc-role' + (data.me.role === 'user' ? ' user' : '');
     document.getElementById('users-btn').style.display = data.isAdmin ? '' : 'none';
+    document.getElementById('settings-btn').style.display = data.isAdmin ? '' : 'none';
     document.getElementById('newshare-btn').style.display = data.isAdmin ? '' : 'none';
   }
   ME_IS_ADMIN = !!data.isAdmin;
@@ -2194,6 +2638,7 @@ process.on("unhandledRejection", (e) => console.error("unhandledRejection:", (e 
 (async () => {
   console.log("Switchboard starting...");
   loadConfig();
+  loadSettings();
   bootstrapUsersIfNeeded();
 
   // Bind the UI port FIRST so Switchboard is responsive instantly, and so the
@@ -2210,6 +2655,9 @@ process.on("unhandledRejection", (e) => console.error("unhandledRejection:", (e 
   // (Re)start saved shares — paused shares stay dormant (no server, no Tailscale).
   for (const s of state.shares) {
     if (s.paused) { s.pid = null; console.log(`Paused (not started): ${s.name}`); continue; }
+    // A share created via the API while the sweep above was running is already
+    // live — starting it again would EADDRINUSE and tear down its tunnel.
+    if (s.pid) continue;
     try { await startShare(s); s.lastError = null; console.log(`Started share: ${s.name}`); }
     catch (e) { s.lastError = e.message; console.error(`Failed to start ${s.name}:`, e.message); }
   }
@@ -2221,6 +2669,7 @@ process.on("unhandledRejection", (e) => console.error("unhandledRejection:", (e 
 function shutdown() {
   console.log("Shutting down...");
   state.shares.forEach(killShareServer);
+  cf.stopAll();
   process.exit(0);
 }
 process.on("SIGINT", shutdown); process.on("SIGTERM", shutdown);
